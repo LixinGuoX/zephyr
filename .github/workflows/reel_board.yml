@@ -30,7 +30,7 @@ jobs:
       run: | 
         echo "Hello ${{ github.event.inputs.name }}"
         cd /home/guo/zephyrproject/zephyr
-        source zephyr.sh
+        source zephyr-env.sh
         git checkout main
         git reset --hard
         twister -p reel_board --device-testing --device-serial /dev/ttyACM0 -T tests/ -j 4
