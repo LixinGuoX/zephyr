@@ -110,10 +110,12 @@
 #define conn_ack(_conn, _req) (_conn)->ack += (_req)
 #endif
 
-#define conn_mss(_conn)					\
-	((_conn)->recv_options.mss_found ?		\
-	 MIN((_conn)->recv_options.mss, \
-	 net_tcp_get_supported_mss(_conn)) : net_tcp_get_supported_mss(_conn))
+#define NET_TCP_DEFAULT_MSS 536
+
+#define conn_mss(_conn)							\
+	MIN((_conn)->recv_options.mss_found ? (_conn)->recv_options.mss	\
+					    : NET_TCP_DEFAULT_MSS,	\
+	    net_tcp_get_supported_mss(_conn))
 
 #define conn_state(_conn, _s)						\
 ({									\
@@ -244,6 +246,7 @@ struct tcp { /* TCP connection */
 	struct k_work_delayable send_data_timer;
 	struct k_work_delayable timewait_timer;
 	struct k_work_delayable persist_timer;
+	struct k_work_delayable ack_timer;
 
 	union {
 		/* Because FIN and establish timers are never happening
@@ -263,8 +266,12 @@ struct tcp { /* TCP connection */
 	enum tcp_data_mode data_mode;
 	uint32_t seq;
 	uint32_t ack;
+	uint16_t recv_win_max;
 	uint16_t recv_win;
 	uint16_t send_win;
+#ifdef CONFIG_NET_TCP_RANDOMIZED_RTO
+	uint16_t rto;
+#endif
 	uint8_t send_data_retries;
 	bool in_retransmission : 1;
 	bool in_connect : 1;

@@ -27,13 +27,12 @@ extern "C" {
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/hci.h>
 
-/** @def BT_ISO_CHAN_SEND_RESERVE
+/**
  *  @brief Headroom needed for outgoing ISO SDUs
  */
 #define BT_ISO_CHAN_SEND_RESERVE BT_BUF_ISO_SIZE(0)
 
-/** @def BT_ISO_SDU_BUF_SIZE
- *
+/**
  *  @brief Helper to calculate needed buffer size for ISO SDUs.
  *         Useful for creating buffer pools.
  *
@@ -232,6 +231,18 @@ struct bt_iso_recv_info {
 
 	/** ISO packet flags bitfield (BT_ISO_FLAGS_*) */
 	uint8_t flags;
+};
+
+/** @brief ISO Meta Data structure for transmitted ISO packets. */
+struct bt_iso_tx_info {
+	/** CIG reference point or BIG anchor point of a transmitted SDU, in microseconds. */
+	uint32_t ts;
+
+	/** Time offset, in microseconds */
+	uint32_t offset;
+
+	/** Packet sequence number */
+	uint16_t seq_num;
 };
 
 
@@ -782,6 +793,22 @@ int bt_iso_chan_get_info(const struct bt_iso_chan *chan,
  *                               will be BT_ISO_CHAN_TYPE_NONE.
  */
 enum bt_iso_chan_type bt_iso_chan_get_type(const struct bt_iso_chan *chan);
+
+/** @brief Get ISO transmission timing info
+ *
+ *  @details Reads timing information for transmitted ISO packet on an ISO channel.
+ *           The HCI_LE_Read_ISO_TX_Sync HCI command is used to retrieve this information
+ *           from the controller.
+ *
+ *  @note An SDU must have already been successfully transmitted on the ISO channel
+ *        for this function to return successfully.
+ *
+ *  @param[in]  chan Channel object.
+ *  @param[out] info Transmit info object.
+ *
+ *  @return Zero on success or (negative) error code on failure.
+ */
+int bt_iso_chan_get_tx_sync(const struct bt_iso_chan *chan, struct bt_iso_tx_info *info);
 
 /** @brief Creates a BIG as a broadcaster
  *

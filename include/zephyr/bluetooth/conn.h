@@ -623,6 +623,11 @@ struct bt_conn_le_create_param {
  *  The application must disable explicit scanning before initiating
  *  a new LE connection.
  *
+ *  When @kconfig{CONFIG_BT_PRIVACY} enabled and @p peer is an identity address
+ *  from a local bond, this API will connect to an advertisement with either:
+ *    - the address being an RPA resolved from the IRK obtained during bonding.
+ *    - the passed identity address, if the local identity is not in Network Privacy Mode.
+ *
  *  @param[in]  peer         Remote address.
  *  @param[in]  create_param Create connection parameters.
  *  @param[in]  conn_param   Initial connection parameters.
@@ -966,8 +971,7 @@ struct bt_conn_cb {
  */
 void bt_conn_cb_register(struct bt_conn_cb *cb);
 
-/** @def BT_CONN_CB_DEFINE
- *
+/**
  *  @brief Register a callback structure for connection events.
  *
  *  @param _name Name of callback structure.
@@ -1053,8 +1057,7 @@ int bt_le_oob_get_sc_data(struct bt_conn *conn,
 			  const struct bt_le_oob_sc_data **oobd_local,
 			  const struct bt_le_oob_sc_data **oobd_remote);
 
-/** @def BT_PASSKEY_INVALID
- *
+/**
  *  Special passkey value that can be used to disable a previously
  *  set fixed passkey.
  */
@@ -1357,6 +1360,22 @@ struct bt_conn_auth_info_cb {
  *  @return Zero on success or negative error code otherwise
  */
 int bt_conn_auth_cb_register(const struct bt_conn_auth_cb *cb);
+
+/** @brief Overlay authentication callbacks used for a given connection.
+ *
+ *  This function can be used only for Bluetooth LE connections.
+ *  The @kconfig{CONFIG_BT_SMP} must be enabled for this function.
+ *
+ *  The authentication callbacks for a given connection cannot be overlaid if
+ *  security procedures in the SMP module have already started. This function
+ *  can be called only once per connection.
+ *
+ *  @param conn	Connection object.
+ *  @param cb	Callback struct.
+ *
+ *  @return Zero on success or negative error code otherwise
+ */
+int bt_conn_auth_cb_overlay(struct bt_conn *conn, const struct bt_conn_auth_cb *cb);
 
 /** @brief Register authentication information callbacks.
  *

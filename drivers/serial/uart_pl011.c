@@ -217,9 +217,9 @@ static bool pl011_is_readable(const struct device *dev)
 	struct pl011_data *data = dev->data;
 
 	if (!data->sbsa &&
-	    (!(get_uart(dev)->cr & PL011_CR_UARTEN) ||
-	     !(get_uart(dev)->cr & PL011_CR_RXE)))
+	    (!(get_uart(dev)->cr & PL011_CR_UARTEN) || !(get_uart(dev)->cr & PL011_CR_RXE))) {
 		return false;
+	}
 
 	return (get_uart(dev)->fr & PL011_FR_RXFE) == 0U;
 }
@@ -422,8 +422,9 @@ static int pl011_init(const struct device *dev)
 #ifdef CONFIG_UART_INTERRUPT_DRIVEN
 	config->irq_config_func(dev);
 #endif
-	if (!data->sbsa)
+	if (!data->sbsa) {
 		pl011_enable(dev);
+	}
 
 	return 0;
 }
@@ -466,7 +467,7 @@ void pl011_isr(const struct device *dev)
 #else
 #define PL011_CONFIG_PORT(n)								\
 	static struct pl011_config pl011_cfg_port_##n = {				\
-		.uart = (volatile struct pl011_regs *)DT_INST_REG_ADDR(n),		\
+		DEVICE_MMIO_ROM_INIT(DT_DRV_INST(n)),					\
 		.sys_clk_freq = DT_INST_PROP_BY_PHANDLE(n, clocks, clock_frequency),	\
 	};
 #endif /* CONFIG_UART_INTERRUPT_DRIVEN */
