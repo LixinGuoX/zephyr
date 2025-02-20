@@ -110,7 +110,7 @@ static int pwm_b91_get_cycles_per_sec(const struct device *dev,
 }
 
 /* PWM driver APIs structure */
-static const struct pwm_driver_api pwm_b91_driver_api = {
+static DEVICE_API(pwm, pwm_b91_driver_api) = {
 	.set_cycles = pwm_b91_set_cycles,
 	.get_cycles_per_sec = pwm_b91_get_cycles_per_sec,
 };
@@ -134,7 +134,7 @@ static const struct pwm_driver_api pwm_b91_driver_api = {
 									       \
 	DEVICE_DT_INST_DEFINE(n, pwm_b91_init,				       \
 			      NULL, NULL, &config##n,			       \
-			      POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEVICE, \
+			      POST_KERNEL, CONFIG_PWM_INIT_PRIORITY,	       \
 			      &pwm_b91_driver_api);
 
 DT_INST_FOREACH_STATUS_OKAY(PWM_B91_INIT)

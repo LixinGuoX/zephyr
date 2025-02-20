@@ -24,19 +24,6 @@ LOG_MODULE_REGISTER(net_ieee802154_6lo, CONFIG_NET_L2_IEEE802154_LOG_LEVEL);
 
 enum net_verdict ieee802154_6lo_decode_pkt(struct net_if *iface, struct net_pkt *pkt)
 {
-	/* Upper IP stack expects the link layer address to be in
-	 * big endian format so we must swap it here.
-	 */
-	if (net_pkt_lladdr_src(pkt)->addr &&
-	    net_pkt_lladdr_src(pkt)->len == IEEE802154_EXT_ADDR_LENGTH) {
-		sys_mem_swap(net_pkt_lladdr_src(pkt)->addr, net_pkt_lladdr_src(pkt)->len);
-	}
-
-	if (net_pkt_lladdr_dst(pkt)->addr &&
-	    net_pkt_lladdr_dst(pkt)->len == IEEE802154_EXT_ADDR_LENGTH) {
-		sys_mem_swap(net_pkt_lladdr_dst(pkt)->addr, net_pkt_lladdr_dst(pkt)->len);
-	}
-
 #ifdef CONFIG_NET_L2_IEEE802154_FRAGMENT
 	return ieee802154_6lo_reassemble(pkt);
 #else
@@ -48,11 +35,12 @@ enum net_verdict ieee802154_6lo_decode_pkt(struct net_if *iface, struct net_pkt 
 #endif /* CONFIG_NET_L2_IEEE802154_FRAGMENT */
 }
 
-bool ieee802154_6lo_encode_pkt(struct net_if *iface, struct net_pkt *pkt,
-			       struct ieee802154_6lo_fragment_ctx *f_ctx, uint8_t ll_hdr_len)
+int ieee802154_6lo_encode_pkt(struct net_if *iface, struct net_pkt *pkt,
+			      struct ieee802154_6lo_fragment_ctx *frag_ctx, uint8_t ll_hdr_len,
+			      uint8_t authtag_len)
 {
 	if (net_pkt_family(pkt) != AF_INET6) {
-		return -EINVAL;
+		return 0;
 	}
 
 	/* hdr_diff will hold the hdr size difference on success */
@@ -63,13 +51,14 @@ bool ieee802154_6lo_encode_pkt(struct net_if *iface, struct net_pkt *pkt,
 	}
 
 #ifdef CONFIG_NET_L2_IEEE802154_FRAGMENT
-	bool requires_fragmentation = ieee802154_6lo_requires_fragmentation(pkt, ll_hdr_len);
+	bool requires_fragmentation =
+		ieee802154_6lo_requires_fragmentation(pkt, ll_hdr_len, authtag_len);
 
 	if (requires_fragmentation) {
-		ieee802154_6lo_fragment_ctx_init(f_ctx, pkt, hdr_diff, true);
+		ieee802154_6lo_fragment_ctx_init(frag_ctx, pkt, hdr_diff, true);
 	}
-	return requires_fragmentation;
+	return requires_fragmentation ? 1 : 0;
 #else
-	return false;
+	return 0;
 #endif /* CONFIG_NET_L2_IEEE802154_FRAGMENT */
 }

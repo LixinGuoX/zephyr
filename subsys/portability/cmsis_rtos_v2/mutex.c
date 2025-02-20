@@ -5,10 +5,11 @@
  */
 
 #include <zephyr/kernel.h>
+#include <zephyr/portability/cmsis_types.h>
 #include <string.h>
 #include "wrapper.h"
 
-K_MEM_SLAB_DEFINE(cv2_mutex_slab, sizeof(struct cv2_mutex),
+K_MEM_SLAB_DEFINE(cmsis_rtos_mutex_cb_slab, sizeof(struct cmsis_rtos_mutex_cb),
 		  CONFIG_CMSIS_V2_MUTEX_MAX_COUNT, 4);
 
 static const osMutexAttr_t init_mutex_attrs = {
@@ -23,7 +24,7 @@ static const osMutexAttr_t init_mutex_attrs = {
  */
 osMutexId_t osMutexNew(const osMutexAttr_t *attr)
 {
-	struct cv2_mutex *mutex;
+	struct cmsis_rtos_mutex_cb *mutex;
 
 	if (k_is_in_isr()) {
 		return NULL;
@@ -36,21 +37,22 @@ osMutexId_t osMutexNew(const osMutexAttr_t *attr)
 	__ASSERT(attr->attr_bits & osMutexPrioInherit,
 		 "Zephyr supports osMutexPrioInherit by default. Do not unselect it\n");
 
-	__ASSERT(!(attr->attr_bits & osMutexRobust),
-		 "Zephyr does not support osMutexRobust.\n");
+	__ASSERT(!(attr->attr_bits & osMutexRobust), "Zephyr does not support osMutexRobust.\n");
 
-	if (k_mem_slab_alloc(&cv2_mutex_slab, (void **)&mutex, K_MSEC(100)) == 0) {
-		memset(mutex, 0, sizeof(struct cv2_mutex));
-	} else {
+	if (attr->cb_mem != NULL) {
+		__ASSERT(attr->cb_size == sizeof(struct cmsis_rtos_mutex_cb), "Invalid cb_size\n");
+		mutex = (struct cmsis_rtos_mutex_cb *)attr->cb_mem;
+	} else if (k_mem_slab_alloc(&cmsis_rtos_mutex_cb_slab, (void **)&mutex, K_MSEC(100)) != 0) {
 		return NULL;
 	}
+	memset(mutex, 0, sizeof(struct cmsis_rtos_mutex_cb));
+	mutex->is_cb_dynamic_allocation = attr->cb_mem == NULL;
 
 	k_mutex_init(&mutex->z_mutex);
 	mutex->state = attr->attr_bits;
 
 	if (attr->name == NULL) {
-		strncpy(mutex->name, init_mutex_attrs.name,
-			sizeof(mutex->name) - 1);
+		strncpy(mutex->name, init_mutex_attrs.name, sizeof(mutex->name) - 1);
 	} else {
 		strncpy(mutex->name, attr->name, sizeof(mutex->name) - 1);
 	}
@@ -63,7 +65,7 @@ osMutexId_t osMutexNew(const osMutexAttr_t *attr)
  */
 osStatus_t osMutexAcquire(osMutexId_t mutex_id, uint32_t timeout)
 {
-	struct cv2_mutex *mutex = (struct cv2_mutex *) mutex_id;
+	struct cmsis_rtos_mutex_cb *mutex = (struct cmsis_rtos_mutex_cb *)mutex_id;
 	int status;
 
 	if (mutex_id == NULL) {
@@ -74,33 +76,18 @@ osStatus_t osMutexAcquire(osMutexId_t mutex_id, uint32_t timeout)
 		return osErrorISR;
 	}
 
-	if (mutex->z_mutex.lock_count == 0U ||
-	    mutex->z_mutex.owner == _current) {
-	}
-
-	/* Throw an error if the mutex is not configured to be recursive and
-	 * the current thread is trying to acquire the mutex again.
-	 */
-	if ((mutex->state & osMutexRecursive) == 0U) {
-		if ((mutex->z_mutex.owner == _current) &&
-		    (mutex->z_mutex.lock_count != 0U)) {
-			return osErrorResource;
-		}
-	}
-
 	if (timeout == osWaitForever) {
 		status = k_mutex_lock(&mutex->z_mutex, K_FOREVER);
 	} else if (timeout == 0U) {
 		status = k_mutex_lock(&mutex->z_mutex, K_NO_WAIT);
 	} else {
-		status = k_mutex_lock(&mutex->z_mutex,
-				      K_TICKS(timeout));
+		status = k_mutex_lock(&mutex->z_mutex, K_TICKS(timeout));
 	}
 
-	if (status == -EBUSY) {
-		return osErrorResource;
-	} else if (status == -EAGAIN) {
+	if (timeout != 0 && (status == -EAGAIN || status == -EBUSY)) {
 		return osErrorTimeout;
+	} else if (status != 0) {
+		return osErrorResource;
 	} else {
 		return osOK;
 	}
@@ -111,7 +98,7 @@ osStatus_t osMutexAcquire(osMutexId_t mutex_id, uint32_t timeout)
  */
 osStatus_t osMutexRelease(osMutexId_t mutex_id)
 {
-	struct cv2_mutex *mutex = (struct cv2_mutex *) mutex_id;
+	struct cmsis_rtos_mutex_cb *mutex = (struct cmsis_rtos_mutex_cb *)mutex_id;
 
 	if (mutex_id == NULL) {
 		return osErrorParameter;
@@ -121,13 +108,9 @@ osStatus_t osMutexRelease(osMutexId_t mutex_id)
 		return osErrorISR;
 	}
 
-	/* Mutex was not obtained before or was not owned by current thread */
-	if ((mutex->z_mutex.lock_count == 0U) ||
-	    (mutex->z_mutex.owner != _current)) {
+	if (k_mutex_unlock(&mutex->z_mutex) != 0) {
 		return osErrorResource;
 	}
-
-	k_mutex_unlock(&mutex->z_mutex);
 
 	return osOK;
 }
@@ -137,7 +120,7 @@ osStatus_t osMutexRelease(osMutexId_t mutex_id)
  */
 osStatus_t osMutexDelete(osMutexId_t mutex_id)
 {
-	struct cv2_mutex *mutex = (struct cv2_mutex *)mutex_id;
+	struct cmsis_rtos_mutex_cb *mutex = (struct cmsis_rtos_mutex_cb *)mutex_id;
 
 	if (mutex_id == NULL) {
 		return osErrorParameter;
@@ -150,16 +133,16 @@ osStatus_t osMutexDelete(osMutexId_t mutex_id)
 	/* The status code "osErrorResource" (mutex specified by parameter
 	 * mutex_id is in an invalid mutex state) is not supported in Zephyr.
 	 */
-
-	k_mem_slab_free(&cv2_mutex_slab, (void *) &mutex);
+	if (mutex->is_cb_dynamic_allocation) {
+		k_mem_slab_free(&cmsis_rtos_mutex_cb_slab, (void *)mutex);
+	}
 
 	return osOK;
 }
 
-
 osThreadId_t osMutexGetOwner(osMutexId_t mutex_id)
 {
-	struct cv2_mutex *mutex = (struct cv2_mutex *)mutex_id;
+	struct cmsis_rtos_mutex_cb *mutex = (struct cmsis_rtos_mutex_cb *)mutex_id;
 
 	if (k_is_in_isr() || (mutex == NULL)) {
 		return NULL;
@@ -175,7 +158,7 @@ osThreadId_t osMutexGetOwner(osMutexId_t mutex_id)
 
 const char *osMutexGetName(osMutexId_t mutex_id)
 {
-	struct cv2_mutex *mutex = (struct cv2_mutex *)mutex_id;
+	struct cmsis_rtos_mutex_cb *mutex = (struct cmsis_rtos_mutex_cb *)mutex_id;
 
 	if (k_is_in_isr() || (mutex == NULL)) {
 		return NULL;

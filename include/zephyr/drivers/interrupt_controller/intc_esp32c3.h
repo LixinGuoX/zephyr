@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#ifndef ZEPHYR_INCLUDE_DRIVERS_ESP_INTR_ALLOC_H__
-#define ZEPHYR_INCLUDE_DRIVERS_ESP_INTR_ALLOC_H__
+#ifndef ZEPHYR_INCLUDE_DRIVERS_INTERRUPT_CONTROLLER_INTC_ESP32C3_H_
+#define ZEPHYR_INCLUDE_DRIVERS_INTERRUPT_CONTROLLER_INTC_ESP32C3_H_
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -17,7 +17,40 @@
 
 /* Keep the LEVELx values as they are here; they match up with (1<<level) */
 #define ESP_INTR_FLAG_LEVEL1		(1<<1)	/* Accept a Level 1 int vector, lowest priority */
-#define ESP_INTR_FLAG_EDGE		    (1<<9)	/* Edge-triggered interrupt */
+#define ESP_INTR_FLAG_LEVEL2		(1<<2)	/* Accept a Level 2 int vector */
+#define ESP_INTR_FLAG_LEVEL3		(1<<3)	/* Accept a Level 3 int vector */
+#define ESP_INTR_FLAG_LEVEL4		(1<<4)	/* Accept a Level 4 int vector */
+#define ESP_INTR_FLAG_LEVEL5		(1<<5)	/* Accept a Level 5 int vector */
+#define ESP_INTR_FLAG_LEVEL6		(1<<6)	/* Accept a Level 6 int vector */
+#define ESP_INTR_FLAG_NMI		(1<<7)	/* Accept a Level 7 int vector, highest priority */
+#define ESP_INTR_FLAG_SHARED		(1<<8)	/* Interrupt can be shared between ISRs */
+#define ESP_INTR_FLAG_EDGE		(1<<9)	/* Edge-triggered interrupt */
+#define ESP_INTR_FLAG_IRAM		(1<<10)	/* ISR can be called if cache is disabled */
+#define ESP_INTR_FLAG_INTRDISABLED	(1<<11)	/* Return with this interrupt disabled */
+
+/* Low and medium prio interrupts. These can be handled in C. */
+#define ESP_INTR_FLAG_LOWMED	(ESP_INTR_FLAG_LEVEL1|ESP_INTR_FLAG_LEVEL2|ESP_INTR_FLAG_LEVEL3)
+
+/* High level interrupts. Need to be handled in assembly. */
+#define ESP_INTR_FLAG_HIGH	(ESP_INTR_FLAG_LEVEL4|ESP_INTR_FLAG_LEVEL5|ESP_INTR_FLAG_LEVEL6| \
+				 ESP_INTR_FLAG_NMI)
+
+/* Mask for all level flags */
+#define ESP_INTR_FLAG_LEVELMASK	(ESP_INTR_FLAG_LEVEL1|ESP_INTR_FLAG_LEVEL2|ESP_INTR_FLAG_LEVEL3| \
+				 ESP_INTR_FLAG_LEVEL4|ESP_INTR_FLAG_LEVEL5|ESP_INTR_FLAG_LEVEL6| \
+				 ESP_INTR_FLAG_NMI)
+
+/*
+ * Get the interrupt flags from the supplied priority.
+ */
+#define ESP_PRIO_TO_FLAGS(priority) \
+	((priority) > 0 ? ((1 << (priority)) & ESP_INTR_FLAG_LEVELMASK) : 0)
+
+/*
+ * Check interrupt flags from input and filter unallowed values.
+ */
+#define ESP_INT_FLAGS_CHECK(int_flags) ((int_flags) & ESP_INTR_FLAG_SHARED)
+
 
 /* Function prototype for interrupt handler function */
 typedef void (*isr_handler_t)(const void *arg);
@@ -85,4 +118,4 @@ int esp_intr_enable(int source);
  */
 uint32_t esp_intr_get_enabled_intmask(int status_mask_number);
 
-#endif
+#endif /* ZEPHYR_INCLUDE_DRIVERS_INTERRUPT_CONTROLLER_INTC_ESP32C3_H_ */

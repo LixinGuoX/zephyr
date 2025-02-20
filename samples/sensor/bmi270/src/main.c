@@ -4,20 +4,20 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <zephyr/zephyr.h>
+#include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/sensor.h>
 #include <stdio.h>
 
-void main(void)
+int main(void)
 {
-	const struct device *dev = DEVICE_DT_GET_ONE(bosch_bmi270);
+	const struct device *const dev = DEVICE_DT_GET_ONE(bosch_bmi270);
 	struct sensor_value acc[3], gyr[3];
 	struct sensor_value full_scale, sampling_freq, oversampling;
 
 	if (!device_is_ready(dev)) {
 		printf("Device %s is not ready\n", dev->name);
-		return;
+		return 0;
 	}
 
 	printf("Device %p name is %s\n", dev, dev->name);
@@ -83,4 +83,5 @@ void main(void)
 		       gyr[1].val1, gyr[1].val2,
 		       gyr[2].val1, gyr[2].val2);
 	}
+	return 0;
 }

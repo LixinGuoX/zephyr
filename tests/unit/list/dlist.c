@@ -39,6 +39,10 @@ static inline bool verify_emptyness(sys_dlist_t *list)
 		return false;
 	}
 
+	if (sys_dlist_len(list) != 0) {
+		return false;
+	}
+
 	count = 0;
 	SYS_DLIST_FOR_EACH_NODE(list, node) {
 		count++;
@@ -94,6 +98,10 @@ static inline bool verify_content_amount(sys_dlist_t *list, int amount)
 	}
 
 	if (!sys_dlist_peek_tail(list)) {
+		return false;
+	}
+
+	if (sys_dlist_len(list) != amount) {
 		return false;
 	}
 
@@ -173,7 +181,7 @@ static inline bool verify_tail_head(sys_dlist_t *list,
  * sys_dlist_remove(), sys_dlist_insert(), sys_dlist_peek_next()
  * SYS_DLIST_ITERATE_FROM_NODE()
  */
-void test_dlist(void)
+ZTEST(dlist_api, test_dlist)
 {
 	sys_dlist_init(&test_list);
 
@@ -339,7 +347,7 @@ int cond(sys_dnode_t *node, void *data)
  * sys_dlist_peek_head_not_empty(),sys_dlist_insert_at(),
  * sys_dlist_peek_prev(),
  */
-void test_dlist2(void)
+ZTEST(dlist_api, test_dlist2)
 {
 	struct container_node test_node[6];
 	struct container_node insert_node;

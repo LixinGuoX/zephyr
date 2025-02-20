@@ -261,7 +261,7 @@
 #define GIC_INTID_SPURIOUS		1023
 
 /* Fixme: update from platform specific define or dt */
-#define GIC_NUM_CPU_IF			CONFIG_MP_NUM_CPUS
+#define GIC_NUM_CPU_IF			CONFIG_MP_MAX_NUM_CPUS
 
 #ifndef _ASMLANGUAGE
 
@@ -293,6 +293,28 @@ void arm_gic_irq_disable(unsigned int irq);
  * @return Returns true if interrupt is enabled, false otherwise
  */
 bool arm_gic_irq_is_enabled(unsigned int irq);
+
+/**
+ * @brief Check if an interrupt is pending
+ *
+ * @param irq interrupt ID
+ * @return Returns true if interrupt is pending, false otherwise
+ */
+bool arm_gic_irq_is_pending(unsigned int irq);
+
+/**
+ * @brief Set interrupt as pending
+ *
+ * @param irq interrupt ID
+ */
+void arm_gic_irq_set_pending(unsigned int irq);
+
+/**
+ * @brief Clear the pending irq
+ *
+ * @param irq interrupt ID
+ */
+void arm_gic_irq_clear_pending(unsigned int irq);
 
 /**
  * @brief Set interrupt priority

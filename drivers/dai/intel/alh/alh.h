@@ -19,6 +19,12 @@
 #define IPC4_ALH_MAX_NUMBER_OF_GTW 16
 #define IPC4_ALH_DAI_INDEX_OFFSET 7
 
+/* copier id = (group id << 4) + codec id + IPC4_ALH_DAI_INDEX_OFFSET
+ * dai_index = (group id << 8) + codec id;
+ */
+#define IPC4_ALH_DAI_INDEX(x) ((((x) & 0xF0) << DAI_NUM_ALH_BI_DIR_LINKS_GROUP) + \
+				(((x) & 0xF) - IPC4_ALH_DAI_INDEX_OFFSET))
+
 #define ALH_GPDMA_BURST_LENGTH 4
 
 #define ALH_SET_BITS(b_hi, b_lo, x)	\
@@ -101,10 +107,14 @@ struct dai_intel_alh_pdata {
 
 struct dai_intel_alh {
 	uint32_t index;		/**< index */
-	struct k_spinlock lock;	/**< locking mechanism */
-	int sref;		/**< simple ref counter, guarded by lock */
 	struct dai_intel_alh_plat_data plat_data;
 	struct dai_intel_alh_pdata priv_data;
+};
+
+/* Common data for all ALH DAI instances */
+struct dai_alh_global_shared {
+	struct k_spinlock lock;	/**< locking mechanism */
+	int sref;		/**< simple ref counter, guarded by lock */
 };
 
 #endif

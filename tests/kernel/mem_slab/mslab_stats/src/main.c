@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <zephyr/zephyr.h>
+#include <zephyr/kernel.h>
 #include <zephyr/ztest.h>
 
 #define BLK_SZ     64
@@ -87,8 +87,8 @@ ZTEST(lib_mem_slab_stats_test, test_mem_slab_runtime_stats)
 
 	/* Free blocks 1 and 2, and then verify the stats. */
 
-	k_mem_slab_free(&kmslab, &memory[2]);
-	k_mem_slab_free(&kmslab, &memory[1]);
+	k_mem_slab_free(&kmslab, memory[2]);
+	k_mem_slab_free(&kmslab, memory[1]);
 
 	status = k_mem_slab_runtime_stats_get(&kmslab, &stats);
 	zassert_equal(status, 0, "Routine failed with status %d\n", status);
@@ -142,8 +142,8 @@ ZTEST(lib_mem_slab_stats_test, test_mem_slab_runtime_stats)
 
 	/* Free the last two blocks; verify stats results */
 
-	k_mem_slab_free(&kmslab, &memory[0]);
-	k_mem_slab_free(&kmslab, &memory[1]);
+	k_mem_slab_free(&kmslab, memory[0]);
+	k_mem_slab_free(&kmslab, memory[1]);
 
 	status = k_mem_slab_runtime_stats_get(&kmslab, &stats);
 	zassert_equal(status, 0, "Routine failed with status %d\n", status);

@@ -7544,11 +7544,10 @@ unsigned int test_120(void)
 }
 
 
-void test_hmac_prng(void)
+ZTEST(hmac_prng_fn, test_hmac_prng)
 {
 	unsigned int result = TC_PASS;
 
-	TC_START("Performing HMAC-PRNG tests:");
 
 	result = test_1();
 	zassert_false(result == TC_FAIL, "HMAC test 1 failed");
@@ -7913,3 +7912,5 @@ void test_hmac_prng(void)
 	TC_PRINT("\n");
 	TC_PRINT("All HMAC-PRNG tests succeeded!\n");
 }
+
+ZTEST_SUITE(hmac_prng_fn, NULL, NULL, NULL, NULL, NULL);

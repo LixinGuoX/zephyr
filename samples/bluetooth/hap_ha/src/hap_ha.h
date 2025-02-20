@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <zephyr/types.h>
+#include <stdint.h>
 
 /**
  * @brief Initialize the BAP Unicast Server role
@@ -18,7 +18,16 @@ int bap_unicast_sr_init(void);
  *
  * @return 0 if success, errno on failure.
  */
-int csip_set_member_init(void (*rsi_changed)(const uint8_t *rsi));
+int csip_set_member_init(void);
+
+/**
+ * @brief Generate the Resolvable Set Identifier (RSI) value.
+ *
+ * @param rsi Pointer to place the 6-octet newly generated RSI data.
+ *
+ * @return 0 if on success, errno on error.
+ */
+int csip_generate_rsi(uint8_t *rsi);
 
 /**
  * @brief Initialize the VCP Volume Renderer role

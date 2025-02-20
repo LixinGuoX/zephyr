@@ -5,9 +5,10 @@
  */
 
 #include <zephyr/logging/log.h>
-#include <zephyr/zephyr.h>
+#include <zephyr/kernel.h>
 #include <zephyr/cache.h>
 #include <zephyr/device.h>
+#include <zephyr/init.h>
 #include <zephyr/sys/atomic.h>
 
 #include <zephyr/ipc/ipc_service_backend.h>
@@ -28,6 +29,12 @@
 #define STATE_READY	(0)
 #define STATE_BUSY	(1)
 #define STATE_INITED	(2)
+
+#if defined(CONFIG_THREAD_MAX_NAME_LEN)
+#define THREAD_MAX_NAME_LEN CONFIG_THREAD_MAX_NAME_LEN
+#else
+#define THREAD_MAX_NAME_LEN 1
+#endif
 
 K_THREAD_STACK_ARRAY_DEFINE(mbox_stack, NUM_INSTANCES, WQ_STACK_SIZE);
 
@@ -54,8 +61,8 @@ struct backend_config_t {
 	unsigned int role;
 	uintptr_t shm_addr;
 	size_t shm_size;
-	struct mbox_channel mbox_tx;
-	struct mbox_channel mbox_rx;
+	struct mbox_dt_spec mbox_tx;
+	struct mbox_dt_spec mbox_rx;
 	unsigned int wq_prio_type;
 	unsigned int wq_prio;
 	unsigned int id;
@@ -86,6 +93,21 @@ static struct ipc_rpmsg_ept *get_ept_slot_with_name(struct ipc_rpmsg_instance *r
 static struct ipc_rpmsg_ept *get_available_ept_slot(struct ipc_rpmsg_instance *rpmsg_inst)
 {
 	return get_ept_slot_with_name(rpmsg_inst, "");
+}
+
+static bool check_endpoints_freed(struct ipc_rpmsg_instance *rpmsg_inst)
+{
+	struct ipc_rpmsg_ept *rpmsg_ept;
+
+	for (size_t i = 0; i < NUM_ENDPOINTS; i++) {
+		rpmsg_ept = &rpmsg_inst->endpoint[i];
+
+		if (rpmsg_ept->bound == true) {
+			return false;
+		}
+	}
+
+	return true;
 }
 
 /*
@@ -179,6 +201,7 @@ static void ns_bind_cb(struct rpmsg_device *rdev, const char *name, uint32_t des
 		 * call by the HOST core.
 		 */
 		strncpy(rpmsg_ept->name, name, sizeof(rpmsg_ept->name));
+		rpmsg_ept->name[RPMSG_NAME_SIZE - 1] = '\0';
 		rpmsg_ept->dest = dest;
 		k_mutex_unlock(&rpmsg_inst->mtx);
 	}
@@ -235,12 +258,34 @@ static int vr_shm_configure(struct ipc_static_vrings *vr, const struct backend_c
 		return -ENOMEM;
 	}
 
-	vr->shm_addr = conf->shm_addr + VDEV_STATUS_SIZE;
-	vr->shm_size = shm_size(num_desc, conf->buffer_size) - VDEV_STATUS_SIZE;
+	/*
+	 * conf->shm_addr  +--------------+  vr->status_reg_addr
+	 *		   |    STATUS    |
+	 *		   +--------------+  vr->shm_addr
+	 *		   |              |
+	 *		   |              |
+	 *		   |   RX BUFS    |
+	 *		   |              |
+	 *		   |              |
+	 *		   +--------------+
+	 *		   |              |
+	 *		   |              |
+	 *		   |   TX BUFS    |
+	 *		   |              |
+	 *		   |              |
+	 *		   +--------------+  vr->rx_addr (aligned)
+	 *		   |   RX VRING   |
+	 *		   +--------------+  vr->tx_addr (aligned)
+	 *		   |   TX VRING   |
+	 *		   +--------------+
+	 */
+
+	vr->shm_addr = ROUND_UP(conf->shm_addr + VDEV_STATUS_SIZE, MEM_ALIGNMENT);
+	vr->shm_size = shm_size(num_desc, conf->buffer_size);
 
 	vr->rx_addr = vr->shm_addr + VRING_COUNT * vq_ring_size(num_desc, conf->buffer_size);
-	vr->tx_addr = ROUND_UP(vr->rx_addr + vring_size(num_desc, VRING_ALIGNMENT),
-			       VRING_ALIGNMENT);
+	vr->tx_addr = ROUND_UP(vr->rx_addr + vring_size(num_desc, MEM_ALIGNMENT),
+			       MEM_ALIGNMENT);
 
 	vr->status_reg_addr = conf->shm_addr;
 
@@ -254,7 +299,7 @@ static void virtio_notify_cb(struct virtqueue *vq, void *priv)
 	struct backend_config_t *conf = priv;
 
 	if (conf->mbox_tx.dev) {
-		mbox_send(&conf->mbox_tx, NULL);
+		mbox_send_dt(&conf->mbox_tx, NULL);
 	}
 }
 
@@ -281,22 +326,50 @@ static int mbox_init(const struct device *instance)
 {
 	const struct backend_config_t *conf = instance->config;
 	struct backend_data_t *data = instance->data;
+	struct k_work_queue_config wq_cfg = {.name = instance->name};
 	int prio, err;
 
 	prio = (conf->wq_prio_type == PRIO_COOP) ? K_PRIO_COOP(conf->wq_prio) :
 						   K_PRIO_PREEMPT(conf->wq_prio);
 
 	k_work_queue_init(&data->mbox_wq);
-	k_work_queue_start(&data->mbox_wq, mbox_stack[conf->id], WQ_STACK_SIZE, prio, NULL);
+	k_work_queue_start(&data->mbox_wq, mbox_stack[conf->id], WQ_STACK_SIZE, prio, &wq_cfg);
+
+	if (IS_ENABLED(CONFIG_THREAD_NAME)) {
+		char name[THREAD_MAX_NAME_LEN];
+
+		snprintk(name, sizeof(name), "mbox_wq #%d", conf->id);
+		k_thread_name_set(&data->mbox_wq.thread, name);
+	}
 
 	k_work_init(&data->mbox_work, mbox_callback_process);
 
-	err = mbox_register_callback(&conf->mbox_rx, mbox_callback, data);
+	err = mbox_register_callback_dt(&conf->mbox_rx, mbox_callback, data);
 	if (err != 0) {
 		return err;
 	}
 
-	return mbox_set_enabled(&conf->mbox_rx, 1);
+	return mbox_set_enabled_dt(&conf->mbox_rx, 1);
+}
+
+static int mbox_deinit(const struct device *instance)
+{
+	const struct backend_config_t *conf = instance->config;
+	struct backend_data_t *data = instance->data;
+	k_tid_t wq_thread;
+	int err;
+
+	err = mbox_set_enabled_dt(&conf->mbox_rx, 0);
+	if (err != 0) {
+		return err;
+	}
+
+	k_work_queue_drain(&data->mbox_wq, 1);
+
+	wq_thread = k_work_queue_thread_get(&data->mbox_wq);
+	k_thread_abort(wq_thread);
+
+	return 0;
 }
 
 static struct ipc_rpmsg_ept *register_ept_on_host(struct ipc_rpmsg_instance *rpmsg_inst,
@@ -331,6 +404,7 @@ static struct ipc_rpmsg_ept *register_ept_on_host(struct ipc_rpmsg_instance *rpm
 		 * not registered the endpoint yet. Cache it.
 		 */
 		strncpy(rpmsg_ept->name, cfg->name, sizeof(rpmsg_ept->name));
+		rpmsg_ept->name[RPMSG_NAME_SIZE - 1] = '\0';
 		k_mutex_unlock(&rpmsg_inst->mtx);
 	}
 
@@ -354,6 +428,7 @@ static struct ipc_rpmsg_ept *register_ept_on_remote(struct ipc_rpmsg_instance *r
 	rpmsg_ept->ep.priv = rpmsg_ept;
 
 	strncpy(rpmsg_ept->name, cfg->name, sizeof(rpmsg_ept->name));
+	rpmsg_ept->name[RPMSG_NAME_SIZE - 1] = '\0';
 
 	err = ipc_rpmsg_register_ept(rpmsg_inst, RPMSG_REMOTE, rpmsg_ept);
 	if (err != 0) {
@@ -390,6 +465,38 @@ static int register_ept(const struct device *instance, void **token,
 	}
 
 	(*token) = rpmsg_ept;
+
+	return 0;
+}
+
+static int deregister_ept(const struct device *instance, void *token)
+{
+	struct backend_data_t *data = instance->data;
+	struct ipc_rpmsg_ept *rpmsg_ept;
+	static struct k_work_sync sync;
+
+	/* Instance is not ready */
+	if (atomic_get(&data->state) != STATE_INITED) {
+		return -EBUSY;
+	}
+
+	rpmsg_ept = (struct ipc_rpmsg_ept *) token;
+
+	/* Endpoint is not registered with instance */
+	if (!rpmsg_ept) {
+		return -ENOENT;
+	}
+
+	/* Drain pending work items before tearing down channel.
+	 *
+	 * Note: `k_work_flush` Faults on Cortex-M33 with "illegal use of EPSR"
+	 * if `sync` is not declared static.
+	 */
+	k_work_flush(&data->mbox_work, &sync);
+
+	rpmsg_destroy_ept(&rpmsg_ept->ep);
+
+	memset(rpmsg_ept, 0, sizeof(struct ipc_rpmsg_ept));
 
 	return 0;
 }
@@ -490,9 +597,9 @@ static int open(const struct device *instance)
 	rpmsg_inst->cb = ept_cb;
 
 	err = ipc_rpmsg_init(rpmsg_inst, data->role, conf->buffer_size,
-			     data->vr.shm_io, &data->vr.vdev,
-			     (void *) data->vr.shm_device.regions->virt,
-			     data->vr.shm_device.regions->size, ns_bind_cb);
+			     &data->vr.shm_io, &data->vr.vdev,
+			     (void *)data->vr.shm_addr,
+			     data->vr.shm_size, ns_bind_cb);
 	if (err != 0) {
 		goto error;
 	}
@@ -513,6 +620,50 @@ error:
 	atomic_set(&data->state, STATE_READY);
 	return err;
 
+}
+
+static int close(const struct device *instance)
+{
+	const struct backend_config_t *conf = instance->config;
+	struct backend_data_t *data = instance->data;
+	struct ipc_rpmsg_instance *rpmsg_inst;
+	int err;
+
+	if (!atomic_cas(&data->state, STATE_INITED, STATE_BUSY)) {
+		return -EALREADY;
+	}
+
+	rpmsg_inst = &data->rpmsg_inst;
+
+	if (!check_endpoints_freed(rpmsg_inst)) {
+		return -EBUSY;
+	}
+
+	err = ipc_rpmsg_deinit(rpmsg_inst, data->role);
+	if (err != 0) {
+		goto error;
+	}
+
+	err = mbox_deinit(instance);
+	if (err != 0) {
+		goto error;
+	}
+
+	err = ipc_static_vrings_deinit(&data->vr, conf->role);
+	if (err != 0) {
+		goto error;
+	}
+
+	memset(&data->vr, 0, sizeof(struct ipc_static_vrings));
+	memset(rpmsg_inst, 0, sizeof(struct ipc_rpmsg_instance));
+
+	atomic_set(&data->state, STATE_READY);
+	return 0;
+
+error:
+	/* Back to the inited state */
+	atomic_set(&data->state, STATE_INITED);
+	return err;
 }
 
 static int get_tx_buffer_size(const struct device *instance, void *token)
@@ -614,7 +765,9 @@ static int drop_tx_buffer(const struct device *instance, void *token,
 
 const static struct ipc_service_backend backend_ops = {
 	.open_instance = open,
+	.close_instance = close,
 	.register_endpoint = register_ept,
+	.deregister_endpoint = deregister_ept,
 	.send = send,
 	.send_nocopy = send_nocopy,
 	.drop_tx_buffer = drop_tx_buffer,
@@ -631,19 +784,38 @@ static int backend_init(const struct device *instance)
 
 	data->role = conf->role;
 
+#if defined(CONFIG_CACHE_MANAGEMENT) && defined(CONFIG_DCACHE)
+	__ASSERT((VDEV_STATUS_SIZE % sys_cache_data_line_size_get()) == 0U,
+		  "VDEV status area must be aligned to the cache line");
+	__ASSERT((MEM_ALIGNMENT % sys_cache_data_line_size_get()) == 0U,
+		  "Static VRINGs must be aligned to the cache line");
+	__ASSERT((conf->buffer_size % sys_cache_data_line_size_get()) == 0U,
+		  "Buffers must be aligned to the cache line ");
+#endif
+
 	k_mutex_init(&data->rpmsg_inst.mtx);
 	atomic_set(&data->state, STATE_READY);
 
 	return 0;
 }
 
+
+#if defined(CONFIG_ARCH_POSIX)
+#define BACKEND_PRE(i) extern char IPC##i##_shm_buffer[];
+#define BACKEND_SHM_ADDR(i) (const uintptr_t)IPC##i##_shm_buffer
+#else
+#define BACKEND_PRE(i)
+#define BACKEND_SHM_ADDR(i) DT_REG_ADDR(DT_INST_PHANDLE(i, memory_region))
+#endif /* defined(CONFIG_ARCH_POSIX) */
+
 #define DEFINE_BACKEND_DEVICE(i)							\
+	BACKEND_PRE(i)									\
 	static struct backend_config_t backend_config_##i = {				\
 		.role = DT_ENUM_IDX_OR(DT_DRV_INST(i), role, ROLE_HOST),		\
 		.shm_size = DT_REG_SIZE(DT_INST_PHANDLE(i, memory_region)),		\
-		.shm_addr = DT_REG_ADDR(DT_INST_PHANDLE(i, memory_region)),		\
-		.mbox_tx = MBOX_DT_CHANNEL_GET(DT_DRV_INST(i), tx),			\
-		.mbox_rx = MBOX_DT_CHANNEL_GET(DT_DRV_INST(i), rx),			\
+		.shm_addr = BACKEND_SHM_ADDR(i),					\
+		.mbox_tx = MBOX_DT_SPEC_INST_GET(i, tx),				\
+		.mbox_rx = MBOX_DT_SPEC_INST_GET(i, rx),				\
 		.wq_prio = COND_CODE_1(DT_INST_NODE_HAS_PROP(i, zephyr_priority),	\
 			   (DT_INST_PROP_BY_IDX(i, zephyr_priority, 0)),		\
 			   (0)),							\
@@ -671,7 +843,7 @@ DT_INST_FOREACH_STATUS_OKAY(DEFINE_BACKEND_DEVICE)
 #define BACKEND_CONFIG_INIT(n) &backend_config_##n,
 
 #if defined(CONFIG_IPC_SERVICE_BACKEND_RPMSG_SHMEM_RESET)
-static int shared_memory_prepare(const struct device *arg)
+static int shared_memory_prepare(void)
 {
 	static const struct backend_config_t *config[] = {
 		DT_INST_FOREACH_STATUS_OKAY(BACKEND_CONFIG_INIT)

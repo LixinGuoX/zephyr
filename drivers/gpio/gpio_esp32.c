@@ -20,7 +20,9 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/dt-bindings/gpio/espressif-esp32-gpio.h>
-#ifdef CONFIG_SOC_ESP32C3
+#if defined(CONFIG_SOC_SERIES_ESP32C2) || \
+	defined(CONFIG_SOC_SERIES_ESP32C3) || \
+	defined(CONFIG_SOC_SERIES_ESP32C6)
 #include <zephyr/drivers/interrupt_controller/intc_esp32c3.h>
 #else
 #include <zephyr/drivers/interrupt_controller/intc_esp32.h>
@@ -28,15 +30,32 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/util.h>
 
-#include "gpio_utils.h"
+#include <zephyr/drivers/gpio/gpio_utils.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(gpio_esp32, CONFIG_LOG_DEFAULT_LEVEL);
 
-#ifdef CONFIG_SOC_ESP32C3
+#ifdef CONFIG_SOC_SERIES_ESP32C2
+#define out	out.val
+#define in	in.val
+#define out_w1ts out_w1ts.val
+#define out_w1tc out_w1tc.val
+/* arch_curr_cpu() is not available for riscv based chips */
+#define CPU_ID()  0
+#define ISR_HANDLER isr_handler_t
+#elif CONFIG_SOC_SERIES_ESP32C3
 /* gpio structs in esp32c3 series are different from xtensa ones */
 #define out out.data
 #define in in.data
+#define out_w1ts out_w1ts.val
+#define out_w1tc out_w1tc.val
+/* arch_curr_cpu() is not available for riscv based chips */
+#define CPU_ID()  0
+#define ISR_HANDLER isr_handler_t
+#elif defined(CONFIG_SOC_SERIES_ESP32C6)
+/* gpio structs in esp32c6 are also different */
+#define out out.out_data_orig
+#define in in.in_data_next
 #define out_w1ts out_w1ts.val
 #define out_w1tc out_w1tc.val
 /* arch_curr_cpu() is not available for riscv based chips */
@@ -89,7 +108,6 @@ static int gpio_esp32_config(const struct device *dev,
 			     gpio_flags_t flags)
 {
 	const struct gpio_esp32_config *const cfg = dev->config;
-	struct gpio_esp32_data *data = dev->data;
 	uint32_t io_pin = (uint32_t) pin + ((cfg->gpio_port == 1 && pin < 32) ? 32 : 0);
 	uint32_t key;
 	int ret = 0;
@@ -118,38 +136,76 @@ static int gpio_esp32_config(const struct device *dev,
 
 	if (flags & GPIO_PULL_UP) {
 		if (!rtc_gpio_is_valid_gpio(io_pin) || SOC_GPIO_SUPPORT_RTC_INDEPENDENT) {
-			gpio_ll_pulldown_dis(&GPIO, io_pin);
 			gpio_ll_pullup_en(&GPIO, io_pin);
 		} else {
 #if SOC_RTCIO_INPUT_OUTPUT_SUPPORTED
 			int rtcio_num = rtc_io_num_map[io_pin];
 
-			rtcio_hal_pulldown_disable(rtc_io_num_map[io_pin]);
-
 			if (rtc_io_desc[rtcio_num].pullup) {
-				rtcio_hal_pullup_enable(rtc_io_num_map[io_pin]);
+				rtcio_hal_pullup_enable(rtcio_num);
 			} else {
 				ret = -ENOTSUP;
 				goto end;
 			}
 #endif
 		}
-	} else if (flags & GPIO_PULL_DOWN) {
+	} else {
 		if (!rtc_gpio_is_valid_gpio(io_pin) || SOC_GPIO_SUPPORT_RTC_INDEPENDENT) {
 			gpio_ll_pullup_dis(&GPIO, io_pin);
+		} else {
+#if SOC_RTCIO_INPUT_OUTPUT_SUPPORTED
+			int rtcio_num = rtc_io_num_map[io_pin];
+
+			if (rtc_io_desc[rtcio_num].pullup) {
+				rtcio_hal_pullup_disable(rtcio_num);
+			}
+#else
+			ret = -ENOTSUP;
+			goto end;
+#endif
+		}
+	}
+
+	if (flags & GPIO_SINGLE_ENDED) {
+		if (flags & GPIO_LINE_OPEN_DRAIN) {
+			gpio_ll_od_enable(cfg->gpio_base, io_pin);
+		} else {
+			LOG_ERR("GPIO configuration not supported");
+			ret = -ENOTSUP;
+			goto end;
+		}
+	} else {
+		gpio_ll_od_disable(cfg->gpio_base, io_pin);
+	}
+
+	if (flags & GPIO_PULL_DOWN) {
+		if (!rtc_gpio_is_valid_gpio(io_pin) || SOC_GPIO_SUPPORT_RTC_INDEPENDENT) {
 			gpio_ll_pulldown_en(&GPIO, io_pin);
 		} else {
 #if SOC_RTCIO_INPUT_OUTPUT_SUPPORTED
 			int rtcio_num = rtc_io_num_map[io_pin];
 
-			rtcio_hal_pulldown_enable(rtc_io_num_map[io_pin]);
-
-			if (rtc_io_desc[rtcio_num].pullup) {
-				rtcio_hal_pullup_disable(rtc_io_num_map[io_pin]);
+			if (rtc_io_desc[rtcio_num].pulldown) {
+				rtcio_hal_pulldown_enable(rtcio_num);
 			} else {
 				ret = -ENOTSUP;
 				goto end;
 			}
+#endif
+		}
+	} else {
+		if (!rtc_gpio_is_valid_gpio(io_pin) || SOC_GPIO_SUPPORT_RTC_INDEPENDENT) {
+			gpio_ll_pulldown_dis(&GPIO, io_pin);
+		} else {
+#if SOC_RTCIO_INPUT_OUTPUT_SUPPORTED
+			int rtcio_num = rtc_io_num_map[io_pin];
+
+			if (rtc_io_desc[rtcio_num].pulldown) {
+				rtcio_hal_pulldown_disable(rtcio_num);
+			}
+#else
+			ret = -ENOTSUP;
+			goto end;
 #endif
 		}
 	}
@@ -160,18 +216,6 @@ static int gpio_esp32_config(const struct device *dev,
 			LOG_ERR("GPIO can only be used as input");
 			ret = -EINVAL;
 			goto end;
-		}
-
-		if (flags & GPIO_SINGLE_ENDED) {
-			if (flags & GPIO_LINE_OPEN_DRAIN) {
-				gpio_ll_od_enable(cfg->gpio_base, io_pin);
-			} else {
-				LOG_ERR("GPIO configuration not supported");
-				ret = -ENOTSUP;
-				goto end;
-			}
-		} else {
-			gpio_ll_od_disable(cfg->gpio_base, io_pin);
 		}
 
 		/*
@@ -209,19 +253,27 @@ static int gpio_esp32_config(const struct device *dev,
 			goto end;
 		}
 
+		gpio_ll_output_enable(&GPIO, io_pin);
+		esp_rom_gpio_matrix_out(io_pin, SIG_GPIO_OUT_IDX, false, false);
+
 		/* Set output pin initial value */
 		if (flags & GPIO_OUTPUT_INIT_HIGH) {
 			gpio_ll_set_level(cfg->gpio_base, io_pin, 1);
 		} else if (flags & GPIO_OUTPUT_INIT_LOW) {
 			gpio_ll_set_level(cfg->gpio_base, io_pin, 0);
 		}
-
-		gpio_ll_output_enable(&GPIO, io_pin);
-		esp_rom_gpio_matrix_out(io_pin, SIG_GPIO_OUT_IDX, false, false);
+	} else {
+		if (!(flags & ESP32_GPIO_PIN_OUT_EN)) {
+			gpio_ll_output_disable(&GPIO, io_pin);
+		}
 	}
 
 	if (flags & GPIO_INPUT) {
 		gpio_ll_input_enable(&GPIO, io_pin);
+	} else {
+		if (!(flags & ESP32_GPIO_PIN_IN_EN)) {
+			gpio_ll_input_disable(&GPIO, io_pin);
+		}
 	}
 
 end:
@@ -236,7 +288,7 @@ static int gpio_esp32_port_get_raw(const struct device *port, uint32_t *value)
 
 	if (cfg->gpio_port == 0) {
 		*value = cfg->gpio_dev->in;
-#if DT_NODE_HAS_STATUS(DT_NODELABEL(gpio1), okay)
+#if DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(gpio1))
 	} else {
 		*value = cfg->gpio_dev->in1.data;
 #endif
@@ -254,7 +306,7 @@ static int gpio_esp32_port_set_masked_raw(const struct device *port,
 
 	if (cfg->gpio_port == 0) {
 		cfg->gpio_dev->out = (cfg->gpio_dev->out & ~mask) | (mask & value);
-#if DT_NODE_HAS_STATUS(DT_NODELABEL(gpio1), okay)
+#if DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(gpio1))
 	} else {
 		cfg->gpio_dev->out1.data = (cfg->gpio_dev->out1.data & ~mask) | (mask & value);
 #endif
@@ -272,7 +324,7 @@ static int gpio_esp32_port_set_bits_raw(const struct device *port,
 
 	if (cfg->gpio_port == 0) {
 		cfg->gpio_dev->out_w1ts = pins;
-#if DT_NODE_HAS_STATUS(DT_NODELABEL(gpio1), okay)
+#if DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(gpio1))
 	} else {
 		cfg->gpio_dev->out1_w1ts.data = pins;
 #endif
@@ -288,7 +340,7 @@ static int gpio_esp32_port_clear_bits_raw(const struct device *port,
 
 	if (cfg->gpio_port == 0) {
 		cfg->gpio_dev->out_w1tc = pins;
-#if DT_NODE_HAS_STATUS(DT_NODELABEL(gpio1), okay)
+#if DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(gpio1))
 	} else {
 		cfg->gpio_dev->out1_w1tc.data = pins;
 #endif
@@ -305,7 +357,7 @@ static int gpio_esp32_port_toggle_bits(const struct device *port,
 
 	if (cfg->gpio_port == 0) {
 		cfg->gpio_dev->out ^= pins;
-#if DT_NODE_HAS_STATUS(DT_NODELABEL(gpio1), okay)
+#if DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(gpio1))
 	} else {
 		cfg->gpio_dev->out1.data ^= pins;
 #endif
@@ -364,6 +416,12 @@ static int gpio_esp32_pin_interrupt_configure(const struct device *port,
 	}
 
 	key = irq_lock();
+	if (cfg->gpio_port == 0) {
+		gpio_ll_clear_intr_status(cfg->gpio_base, BIT(pin));
+	} else {
+		gpio_ll_clear_intr_status_high(cfg->gpio_base, BIT(pin));
+	}
+
 	gpio_ll_set_intr_type(cfg->gpio_base, io_pin, intr_trig_mode);
 	gpio_ll_intr_enable_on_core(cfg->gpio_base, CPU_ID(), io_pin);
 	irq_unlock(key);
@@ -419,15 +477,20 @@ static void gpio_esp32_isr(void *param);
 
 static int gpio_esp32_init(const struct device *dev)
 {
-	struct gpio_esp32_data *data = dev->data;
 	static bool isr_connected;
 
 	if (!isr_connected) {
-		esp_intr_alloc(DT_IRQN(DT_NODELABEL(gpio0)),
-			0,
+		int ret = esp_intr_alloc(DT_IRQ_BY_IDX(DT_NODELABEL(gpio0), 0, irq),
+			ESP_PRIO_TO_FLAGS(DT_IRQ_BY_IDX(DT_NODELABEL(gpio0), 0, priority)) |
+			ESP_INT_FLAGS_CHECK(DT_IRQ_BY_IDX(DT_NODELABEL(gpio0), 0, flags)),
 			(ISR_HANDLER)gpio_esp32_isr,
 			(void *)dev,
 			NULL);
+
+		if (ret != 0) {
+			LOG_ERR("could not allocate interrupt (err %d)", ret);
+			return ret;
+		}
 
 		isr_connected = true;
 	}
@@ -435,7 +498,7 @@ static int gpio_esp32_init(const struct device *dev)
 	return 0;
 }
 
-static const struct gpio_driver_api gpio_esp32_driver_api = {
+static DEVICE_API(gpio, gpio_esp32_driver_api) = {
 	.pin_configure = gpio_esp32_config,
 	.port_get_raw = gpio_esp32_port_get_raw,
 	.port_set_masked_raw = gpio_esp32_port_set_masked_raw,
@@ -472,11 +535,11 @@ static void IRAM_ATTR gpio_esp32_isr(void *param)
 {
 	ARG_UNUSED(param);
 
-#if DT_NODE_HAS_STATUS(DT_NODELABEL(gpio0), okay)
+#if DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(gpio0))
 	gpio_esp32_fire_callbacks(DEVICE_DT_INST_GET(0));
 #endif
 
-#if DT_NODE_HAS_STATUS(DT_NODELABEL(gpio1), okay)
+#if DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(gpio1))
 	gpio_esp32_fire_callbacks(DEVICE_DT_INST_GET(1));
 #endif
 }

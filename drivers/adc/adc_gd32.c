@@ -7,9 +7,14 @@
 #define DT_DRV_COMPAT gd_gd32_adc
 
 #include <errno.h>
+
+#include <zephyr/drivers/clock_control.h>
+#include <zephyr/drivers/clock_control/gd32.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/adc.h>
+#include <zephyr/drivers/reset.h>
 #include <zephyr/devicetree.h>
+#include <zephyr/irq.h>
 
 #include <gd32_adc.h>
 #include <gd32_rcu.h>
@@ -36,9 +41,9 @@ LOG_MODULE_REGISTER(adc_gd32, CONFIG_ADC_LOG_LEVEL);
 #define ADC1_NODE		DT_NODELABEL(adc1)
 #define ADC2_NODE		DT_NODELABEL(adc2)
 
-#define ADC0_ENABLE		DT_NODE_HAS_STATUS(ADC0_NODE, okay)
-#define ADC1_ENABLE		DT_NODE_HAS_STATUS(ADC1_NODE, okay)
-#define ADC2_ENABLE		DT_NODE_HAS_STATUS(ADC2_NODE, okay)
+#define ADC0_ENABLE		DT_NODE_HAS_STATUS_OKAY(ADC0_NODE)
+#define ADC1_ENABLE		DT_NODE_HAS_STATUS_OKAY(ADC1_NODE)
+#define ADC2_ENABLE		DT_NODE_HAS_STATUS_OKAY(ADC2_NODE)
 
 #ifndef	ADC0
 /**
@@ -79,6 +84,34 @@ static const uint32_t table_samp_time[] = {
 	SMP_TIME(144),
 	SMP_TIME(480)
 };
+#elif defined(CONFIG_SOC_SERIES_GD32L23X)
+#define SMP_TIME(x)	ADC_SAMPLETIME_##x##POINT5
+
+static const uint16_t acq_time_tbl[8] = {3, 8, 14, 29, 42, 56, 72, 240};
+static const uint32_t table_samp_time[] = {
+	SMP_TIME(2),
+	SMP_TIME(7),
+	SMP_TIME(13),
+	SMP_TIME(28),
+	SMP_TIME(41),
+	SMP_TIME(55),
+	SMP_TIME(71),
+	SMP_TIME(239),
+};
+#elif defined(CONFIG_SOC_SERIES_GD32A50X)
+#define SMP_TIME(x)	ADC_SAMPLETIME_##x##POINT5
+
+static const uint16_t acq_time_tbl[8] = {3, 15, 28, 56, 84, 112, 144, 480};
+static const uint32_t table_samp_time[] = {
+	SMP_TIME(2),
+	SMP_TIME(14),
+	SMP_TIME(27),
+	SMP_TIME(55),
+	SMP_TIME(83),
+	SMP_TIME(111),
+	SMP_TIME(143),
+	SMP_TIME(479)
+};
 #else
 #define SMP_TIME(x)	ADC_SAMPLETIME_##x##POINT5
 
@@ -97,10 +130,11 @@ static const uint32_t table_samp_time[] = {
 
 struct adc_gd32_config {
 	uint32_t reg;
-	uint32_t rcu_periph_clock;
 #ifdef CONFIG_SOC_SERIES_GD32F3X0
 	uint32_t rcu_clock_source;
 #endif
+	uint16_t clkid;
+	struct reset_dt_spec reset;
 	uint8_t channels;
 	const struct pinctrl_dev_config *pcfg;
 	uint8_t irq_num;
@@ -265,10 +299,12 @@ static int adc_gd32_start_read(const struct device *dev,
 	}
 
 #if defined(CONFIG_SOC_SERIES_GD32F4XX) || \
-	defined(CONFIG_SOC_SERIES_GD32F3X0)
+	defined(CONFIG_SOC_SERIES_GD32F3X0) || \
+	defined(CONFIG_SOC_SERIES_GD32L23X)
 	ADC_CTL0(cfg->reg) &= ~ADC_CTL0_DRES;
 	ADC_CTL0(cfg->reg) |= CTL0_DRES(resolution_id);
-#elif defined(CONFIG_SOC_SERIES_GD32F403)
+#elif defined(CONFIG_SOC_SERIES_GD32F403) || \
+	defined(CONFIG_SOC_SERIES_GD32A50X)
 	ADC_OVSAMPCTL(cfg->reg) &= ~ADC_OVSAMPCTL_DRES;
 	ADC_OVSAMPCTL(cfg->reg) |= OVSAMPCTL_DRES(resolution_id);
 #elif defined(CONFIG_SOC_SERIES_GD32VF103)
@@ -320,7 +356,7 @@ static int adc_gd32_read_async(const struct device *dev,
 }
 #endif /* CONFIG_ADC_ASYNC */
 
-static struct adc_driver_api adc_gd32_driver_api = {
+static DEVICE_API(adc, adc_gd32_driver_api) = {
 	.channel_setup = adc_gd32_channel_setup,
 	.read = adc_gd32_read,
 #ifdef CONFIG_ADC_ASYNC
@@ -346,16 +382,25 @@ static int adc_gd32_init(const struct device *dev)
 	rcu_adc_clock_config(cfg->rcu_clock_source);
 #endif
 
-	rcu_periph_clock_enable(cfg->rcu_periph_clock);
+	(void)clock_control_on(GD32_CLOCK_CONTROLLER,
+			       (clock_control_subsys_t)&cfg->clkid);
+
+	(void)reset_line_toggle_dt(&cfg->reset);
 
 #if defined(CONFIG_SOC_SERIES_GD32F403) || \
 	defined(CONFIG_SOC_SERIES_GD32VF103) || \
-	defined(CONFIG_SOC_SERIES_GD32F3X0)
+	defined(CONFIG_SOC_SERIES_GD32F3X0) || \
+	defined(CONFIG_SOC_SERIES_GD32L23X)
 	/* Set SWRCST as the regular channel external trigger. */
 	ADC_CTL1(cfg->reg) &= ~ADC_CTL1_ETSRC;
 	ADC_CTL1(cfg->reg) |= CTL1_ETSRC(7);
 
 	/* Enable external trigger for regular channel. */
+	ADC_CTL1(cfg->reg) |= ADC_CTL1_ETERC;
+#endif
+
+#ifdef CONFIG_SOC_SERIES_GD32A50X
+	ADC_CTL1(cfg->reg) |= ADC_CTL1_ETSRC;
 	ADC_CTL1(cfg->reg) |= ADC_CTL1_ETERC;
 #endif
 
@@ -372,7 +417,7 @@ static int adc_gd32_init(const struct device *dev)
 }
 
 #define HANDLE_SHARED_IRQ(n, active_irq)							\
-	static const struct device *dev_##n = DEVICE_DT_INST_GET(n);				\
+	static const struct device *const dev_##n = DEVICE_DT_INST_GET(n);			\
 	const struct adc_gd32_config *cfg_##n = dev_##n->config;				\
 												\
 	if ((cfg_##n->irq_num == active_irq) &&							\
@@ -431,7 +476,7 @@ static void adc_gd32_global_irq_cfg(void)
 
 #ifdef CONFIG_SOC_SERIES_GD32F3X0
 #define ADC_CLOCK_SOURCE(n)									\
-	.rcu_clock_source = DT_INST_PROP(n, rcu_periph_clock)
+	.rcu_clock_source = DT_INST_PROP(n, rcu_clock_source)
 #else
 #define ADC_CLOCK_SOURCE(n)
 #endif
@@ -445,7 +490,8 @@ static void adc_gd32_global_irq_cfg(void)
 	};											\
 	const static struct adc_gd32_config adc_gd32_config_##n = {				\
 		.reg = DT_INST_REG_ADDR(n),							\
-		.rcu_periph_clock = DT_INST_PROP(n, rcu_periph_clock),				\
+		.clkid = DT_INST_CLOCKS_CELL(n, id),						\
+		.reset = RESET_DT_SPEC_INST_GET(n),						\
 		.channels = DT_INST_PROP(n, channels),						\
 		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(n),					\
 		.irq_num = DT_INST_IRQN(n),							\

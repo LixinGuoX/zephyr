@@ -6,7 +6,6 @@
 
 #include <zephyr/ztest.h>
 
-#define NSEC_PER_MSEC (uint64_t)(NSEC_PER_USEC * USEC_PER_MSEC)
 /**
  * @brief Test delay during boot
  * @defgroup kernel_init_tests Init
@@ -39,6 +38,9 @@ ZTEST(boot_delay, test_bootdelay)
 			(uint32_t)k_cyc_to_ns_floor64(current_cycles),
 			(NSEC_PER_MSEC * CONFIG_BOOT_DELAY));
 }
+
+extern void *common_setup(void);
+ZTEST_SUITE(boot_delay, NULL, common_setup, NULL, NULL, NULL);
 
 /**
  * @}

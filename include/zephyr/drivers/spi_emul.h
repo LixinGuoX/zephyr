@@ -10,6 +10,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/emul.h>
 #include <zephyr/drivers/spi.h>
+#include <zephyr/sys/slist.h>
 #include <zephyr/types.h>
 
 /**
@@ -41,6 +42,12 @@ struct spi_emul {
 
 	/* API provided for this device */
 	const struct spi_emul_api *api;
+
+	/**
+	 * A mock API that if not NULL will take precedence over the actual API. If set, a return
+	 * value of -ENOSYS will revert back to the default api.
+	 */
+	struct spi_emul_api *mock_api;
 
 	/* SPI chip-select of the emulated device */
 	uint16_t chipsel;

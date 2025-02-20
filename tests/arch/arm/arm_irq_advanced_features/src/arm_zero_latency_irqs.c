@@ -6,7 +6,8 @@
 
 #include <zephyr/ztest.h>
 #include <zephyr/arch/cpu.h>
-#include <zephyr/arch/arm/aarch32/cortex_m/cmsis.h>
+#include <cmsis_core.h>
+#include <zephyr/sys/barrier.h>
 
 static volatile int test_flag;
 
@@ -69,17 +70,14 @@ ZTEST(arm_irq_advanced_features, test_arm_zero_latency_irqs)
 		}
 	}
 
-	zassert_true(i >= 0,
-		"No available IRQ line to configure as zero-latency\n");
+	zassert_true(i >= 0, "No available IRQ line to configure as zero-latency\n");
 
 	TC_PRINT("Available IRQ line: %u\n", i);
 
 	/* Configure the available IRQ line as zero-latency. */
 
-	arch_irq_connect_dynamic(i, 0 /* Unused */,
-		arm_zero_latency_isr_handler,
-		NULL,
-		IRQ_ZERO_LATENCY);
+	arch_irq_connect_dynamic(i, 0 /* Unused */, arm_zero_latency_isr_handler, NULL,
+				 IRQ_ZERO_LATENCY);
 
 	NVIC_ClearPendingIRQ(i);
 	NVIC_EnableIRQ(i);
@@ -94,8 +92,8 @@ ZTEST(arm_irq_advanced_features, test_arm_zero_latency_irqs)
 	 * Instruction barriers to make sure the NVIC IRQ is
 	 * set to pending state before 'test_flag' is checked.
 	 */
-	__DSB();
-	__ISB();
+	barrier_dsync_fence_full();
+	barrier_isync_fence_full();
 
 	/* Confirm test flag is set by the zero-latency ISR handler. */
 	post_flag = test_flag;

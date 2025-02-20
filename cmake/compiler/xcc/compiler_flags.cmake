@@ -9,3 +9,12 @@ include(${ZEPHYR_BASE}/cmake/compiler/gcc/compiler_flags.cmake)
 check_set_compiler_property(APPEND PROPERTY warning_base "-fgnu89-inline")
 
 set_compiler_property(PROPERTY warning_error_misra_sane)
+
+# XCC does not support -fno-pic and -fno-pie
+set_compiler_property(PROPERTY no_position_independent "")
+
+# Remove after testing that -Wshadow works
+set_compiler_property(PROPERTY warning_shadow_variables)
+
+# xcc does not recognize -fno-printf-return-value
+set_compiler_property(PROPERTY no_printf_return_value)

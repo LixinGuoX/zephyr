@@ -18,7 +18,13 @@
 #include <zephyr/kernel.h>
 #include <kernel_internal.h>
 #include <string.h>
+
+/* internal kernel APIs */
 #include <ksched.h>
+#include <kthread.h>
+
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(test);
 
 struct k_thread tdata;
 #define STACK_SIZE (512 + CONFIG_TEST_EXTRA_STACK_SIZE)
@@ -40,7 +46,7 @@ static ZTEST_DMEM int tp = 10;
  */
 ZTEST(threads_lifecycle, test_systhreads_main)
 {
-	zassert_true(main_prio == CONFIG_MAIN_THREAD_PRIORITY, NULL);
+	zassert_true(main_prio == CONFIG_MAIN_THREAD_PRIORITY, "%d", CONFIG_MAIN_THREAD_PRIORITY);
 }
 
 /**
@@ -65,7 +71,7 @@ static void customdata_entry(void *p1, void *p2, void *p3)
 		/* relinquish cpu for a while */
 		k_msleep(50);
 		/** TESTPOINT: custom data comparison */
-		zassert_equal(data, (long)k_thread_custom_data_get(), NULL);
+		zassert_equal(data, (long)k_thread_custom_data_get());
 		data++;
 	}
 }
@@ -151,7 +157,7 @@ ZTEST_USER(threads_lifecycle, test_thread_name_user_get_set)
 	/* Non-Secure images cannot normally access memory outside the image
 	 * flash and ram.
 	 */
-	ret = k_thread_name_set(NULL, (const char *)0xFFFFFFF0);
+	ret = k_thread_name_set(NULL, (const char *)CONFIG_THREAD_API_UNMAPPED_ADDRESS);
 	zassert_equal(ret, -EFAULT, "accepted nonsense string (%d)", ret);
 #endif
 	ret = k_thread_name_set(NULL, unreadable_string);
@@ -182,8 +188,8 @@ ZTEST_USER(threads_lifecycle, test_thread_name_user_get_set)
 	zassert_equal(ret, -EINVAL, "not a thread object");
 	ret = k_thread_name_copy(&z_main_thread, thread_name,
 				     sizeof(thread_name));
-	zassert_equal(ret, 0, "couldn't get main thread name");
-	printk("Main thread name is '%s'\n", thread_name);
+	zassert_equal(ret, 0, "couldn't get main thread name: %s (%d)", thread_name, ret);
+	LOG_DBG("Main thread name is '%s'", thread_name);
 
 	/* Set and get child thread's name */
 	k_tid_t tid = k_thread_create(&tdata_name, tstack_name, STACK_SIZE,
@@ -226,7 +232,7 @@ static void umode_entry(void *thread_id, void *p2, void *p3)
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	if (!z_is_thread_essential() &&
+	if (!z_is_thread_essential(_current) &&
 	    (k_current_get() == (k_tid_t)thread_id)) {
 		ztest_test_pass();
 	} else {
@@ -243,12 +249,12 @@ static void umode_entry(void *thread_id, void *p2, void *p3)
  */
 static void enter_user_mode_entry(void *p1, void *p2, void *p3)
 {
-	z_thread_essential_set();
+	z_thread_essential_set(_current);
 
-	zassert_true(z_is_thread_essential(), "Thread isn't set"
+	zassert_true(z_is_thread_essential(_current), "Thread isn't set"
 		     " as essential\n");
 
-	k_thread_user_mode_enter((k_thread_entry_t)umode_entry,
+	k_thread_user_mode_enter(umode_entry,
 				 k_current_get(), NULL, NULL);
 }
 
@@ -278,7 +284,7 @@ enum control_method {
 	ISR_RUNNING
 };
 
-void join_entry(void *p1, void *p2, void *p3)
+static void join_entry(void *p1, void *p2, void *p3)
 {
 	enum control_method m = (enum control_method)(intptr_t)p1;
 
@@ -288,41 +294,41 @@ void join_entry(void *p1, void *p2, void *p3)
 	case OTHER_ABORT:
 	case OTHER_ABORT_TIMEOUT:
 	case ISR_RUNNING:
-		printk("join_thread: sleeping forever\n");
+		LOG_DBG("join_thread: sleeping forever");
 		k_sleep(K_FOREVER);
 		break;
 	case SELF_ABORT:
 	case ALREADY_EXIT:
 	case ISR_ALREADY_EXIT:
-		printk("join_thread: self-exiting\n");
+		LOG_DBG("join_thread: self-exiting");
 		return;
 	}
 }
 
-void control_entry(void *p1, void *p2, void *p3)
+static void control_entry(void *p1, void *p2, void *p3)
 {
-	printk("control_thread: killing join thread\n");
+	LOG_DBG("control_thread: killing join thread");
 	k_thread_abort(&join_thread);
 }
 
-void do_join_from_isr(const void *arg)
+static void do_join_from_isr(const void *arg)
 {
 	int *ret = (int *)arg;
 
-	zassert_true(k_is_in_isr(), NULL);
-	printk("isr: joining join_thread\n");
+	zassert_true(k_is_in_isr());
+	LOG_DBG("isr: joining join_thread");
 	*ret = k_thread_join(&join_thread, K_NO_WAIT);
-	printk("isr: k_thread_join() returned with %d\n", *ret);
+	LOG_DBG("isr: k_thread_join() returned with %d", *ret);
 }
 
 #define JOIN_TIMEOUT_MS	100
 
-int join_scenario_interval(enum control_method m, int64_t *interval)
+static int join_scenario_interval(enum control_method m, int64_t *interval)
 {
 	k_timeout_t timeout = K_FOREVER;
-	int ret;
+	int ret = 0;
 
-	printk("ztest_thread: method %d, create join_thread\n", m);
+	LOG_DBG("ztest_thread: method %d, create join_thread", m);
 	k_thread_create(&join_thread, join_stack, STACK_SIZE, join_entry,
 			(void *)m, NULL, NULL, K_PRIO_PREEMPT(1),
 			K_USER | K_INHERIT_PERMS, K_NO_WAIT);
@@ -337,7 +343,7 @@ int join_scenario_interval(enum control_method m, int64_t *interval)
 		timeout = K_MSEC(JOIN_TIMEOUT_MS);
 		__fallthrough;
 	case OTHER_ABORT:
-		printk("ztest_thread: create control_thread\n");
+		LOG_DBG("ztest_thread: create control_thread");
 		k_thread_create(&control_thread, control_stack, STACK_SIZE,
 				control_entry, NULL, NULL, NULL,
 				K_PRIO_PREEMPT(2),
@@ -356,7 +362,7 @@ int join_scenario_interval(enum control_method m, int64_t *interval)
 	if (m == ISR_ALREADY_EXIT || m == ISR_RUNNING) {
 		irq_offload(do_join_from_isr, (const void *)&ret);
 	} else {
-		printk("ztest_thread: joining join_thread\n");
+		LOG_DBG("ztest_thread: joining join_thread");
 
 		if (interval != NULL) {
 			*interval = k_uptime_get();
@@ -368,7 +374,7 @@ int join_scenario_interval(enum control_method m, int64_t *interval)
 			*interval = k_uptime_get() - *interval;
 		}
 
-		printk("ztest_thread: k_thread_join() returned with %d\n", ret);
+		LOG_DBG("ztest_thread: k_thread_join() returned with %d", ret);
 	}
 
 	if (ret != 0) {
@@ -421,7 +427,7 @@ K_THREAD_STACK_DEFINE(deadlock1_stack, STACK_SIZE);
 struct k_thread deadlock2_thread;
 K_THREAD_STACK_DEFINE(deadlock2_stack, STACK_SIZE);
 
-void deadlock1_entry(void *p1, void *p2, void *p3)
+static void deadlock1_entry(void *p1, void *p2, void *p3)
 {
 	int ret;
 
@@ -431,7 +437,7 @@ void deadlock1_entry(void *p1, void *p2, void *p3)
 	zassert_equal(ret, -EDEADLK, "failed mutual join case");
 }
 
-void deadlock2_entry(void *p1, void *p2, void *p3)
+static void deadlock2_entry(void *p1, void *p2, void *p3)
 {
 	int ret;
 
@@ -470,6 +476,7 @@ static void user_start_thread(void *p1, void *p2, void *p3)
 {
 	/* do nothing */
 }
+
 ZTEST_USER(threads_lifecycle, test_thread_timeout_remaining_expires)
 {
 	k_ticks_t r, e, r1, ticks, expected_expires_ticks;
@@ -484,18 +491,18 @@ ZTEST_USER(threads_lifecycle, test_thread_timeout_remaining_expires)
 
 	k_msleep(10);
 	e = k_thread_timeout_expires_ticks(tid);
-	TC_PRINT("thread_expires_ticks: %d, expect: %d\n", (int)e,
+	LOG_DBG("thread_expires_ticks: %d, expect: %d", (int)e,
 		(int)expected_expires_ticks);
-	zassert_true(e >= expected_expires_ticks, NULL);
+	zassert_true(e >= expected_expires_ticks);
 
 	k_msleep(10);
 	r = k_thread_timeout_remaining_ticks(tid);
-	zassert_true(r < ticks, NULL);
+	zassert_true(r < ticks);
 	r1 = r;
 
 	k_msleep(10);
 	r = k_thread_timeout_remaining_ticks(tid);
-	zassert_true(r < r1, NULL);
+	zassert_true(r < r1);
 
 	k_thread_abort(tid);
 }
@@ -512,14 +519,15 @@ static void foreach_callback(const struct k_thread *thread, void *user_data)
 
 	/* Check NULL parameters */
 	ret = k_thread_runtime_stats_get(NULL, &stats);
-	zassert_true(ret == -EINVAL, NULL);
+	zassert_true(ret == -EINVAL);
 	ret = k_thread_runtime_stats_get((k_tid_t)thread, NULL);
-	zassert_true(ret == -EINVAL, NULL);
+	zassert_true(ret == -EINVAL);
 
 	k_thread_runtime_stats_get((k_tid_t)thread, &stats);
 	((k_thread_runtime_stats_t *)user_data)->execution_cycles +=
 		stats.execution_cycles;
 }
+
 /* This case accumulates every thread's execution_cycles first, then
  * get the total execution_cycles from a global
  * k_thread_runtime_stats_t to see that all time is reflected in the
@@ -536,11 +544,11 @@ ZTEST(threads_lifecycle, test_thread_runtime_stats_get)
 
 	/* Check NULL parameters */
 	ret = k_thread_runtime_stats_all_get(NULL);
-	zassert_true(ret == -EINVAL, NULL);
+	zassert_true(ret == -EINVAL);
 
 	k_thread_runtime_stats_all_get(&stats_all);
 
-	zassert_true(stats.execution_cycles <= stats_all.execution_cycles, NULL);
+	zassert_true(stats.execution_cycles <= stats_all.execution_cycles);
 }
 
 ZTEST(threads_lifecycle, test_k_busy_wait)
@@ -559,7 +567,7 @@ ZTEST(threads_lifecycle, test_k_busy_wait)
 	 * their cycle rate)
 	 */
 	dt = test_stats.execution_cycles - cycles;
-	zassert_true(dt < k_ms_to_cyc_ceil64(10), NULL);
+	zassert_true(dt < k_ms_to_cyc_ceil64(10));
 
 	cycles = test_stats.execution_cycles;
 	k_busy_wait(100);
@@ -567,7 +575,13 @@ ZTEST(threads_lifecycle, test_k_busy_wait)
 
 	/* execution_cycles increases correctly */
 	dt = test_stats.execution_cycles - cycles;
-	zassert_true(dt >= k_us_to_cyc_floor64(100), NULL);
+
+	/* execution cycles may not increase by the full 100µs as the
+	 * system may be doing something else during the busy
+	 * wait. Experimentally, we see at least 80% of the cycles
+	 * consumed in the busy wait loop on current test targets.
+	 */
+	zassert_true(dt >= k_us_to_cyc_floor64(80));
 }
 
 static void tp_entry(void *p1, void *p2, void *p3)
@@ -585,16 +599,16 @@ ZTEST_USER(threads_lifecycle_1cpu, test_k_busy_wait_user)
 	/* this is a 1cpu test case, the new thread has no chance to be
 	 * scheduled and value of tp not changed
 	 */
-	zassert_false(tp == 100, NULL);
+	zassert_false(tp == 100);
 
 	/* give up cpu, the new thread will change value of tp to 100 */
 	k_msleep(100);
-	zassert_true(tp == 100, NULL);
+	zassert_true(tp == 100);
 	k_thread_abort(tid);
 }
 
 #define INT_ARRAY_SIZE 128
-int large_stack(size_t *space)
+static int large_stack(size_t *space)
 {
 	/* use "volatile" to protect this variable from being optimized out */
 	volatile int a[INT_ARRAY_SIZE];
@@ -605,7 +619,7 @@ int large_stack(size_t *space)
 
 }
 
-int small_stack(size_t *space)
+static int small_stack(size_t *space)
 {
 	return k_thread_stack_space_get(k_current_get(), space);
 }
@@ -622,13 +636,13 @@ ZTEST_USER(threads_lifecycle, test_k_thread_stack_space_get_user)
 	large_stack(&b);
 	/* FIXME: Ideally, the follow condition will assert true:
 	 * (a - b) == INT_ARRAY_SIZE * sizeof(int)
-	 * but it is not the case in native_posix, qemu_leon3 and
+	 * but it is not the case in native_sim, qemu_leon3 and
 	 * qemu_cortex_a53. Relax check condition here
 	 */
-	zassert_true(b <= a, NULL);
+	zassert_true(b <= a);
 }
 
-void *thread_test_setup(void)
+static void *thread_test_setup(void)
 {
 	k_thread_access_grant(k_current_get(), &tdata, tstack,
 			      &tdata_custom, tstack_custom,

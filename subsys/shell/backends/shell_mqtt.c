@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <zephyr/zephyr.h>
+#include <zephyr/kernel.h>
 #include <zephyr/shell/shell_mqtt.h>
 #include <zephyr/init.h>
 #include <zephyr/logging/log.h>
@@ -70,7 +70,7 @@ static void sh_mqtt_rx_rb_flush(void)
 	uint8_t c;
 	uint32_t size = ring_buf_size_get(&sh_mqtt->rx_rb);
 
-	while (size) {
+	while (size > 0) {
 		size = ring_buf_get(&sh_mqtt->rx_rb, &c, 1U);
 	}
 }
@@ -106,6 +106,13 @@ static void clear_fds(void)
 	sh_mqtt->nfds = 0;
 }
 
+/*
+ * Upon successful completion, poll() shall return a non-negative value. A positive value indicates
+ * the total number of pollfd structures that have selected events (that is, those for which the
+ * revents member is non-zero). A value of 0 indicates that the call timed out and no file
+ * descriptors have been selected. Upon failure, poll() shall return -1 and set errno to indicate
+ * the error.
+ */
 static int wait(int timeout)
 {
 	int rc = 0;
@@ -163,7 +170,7 @@ static void sh_mqtt_close_and_cleanup(void)
 	}
 
 	/* If network/mqtt disconnected, or mqtt_disconnect failed, do mqtt_abort */
-	if (rc) {
+	if (rc < 0) {
 		/* mqtt_abort doesn't send disconnection packet to the broker, but it
 		 * makes sure that the MQTT connection is aborted locally and will
 		 * always invoke mqtt_evt_handler:MQTT_EVT_DISCONNECT
@@ -230,7 +237,7 @@ static void sh_mqtt_process_handler(struct k_work *work)
 	}
 
 	/* If context can't be locked, that means net conn cb locked it */
-	if (sh_mqtt_context_lock(K_NO_WAIT)) {
+	if (sh_mqtt_context_lock(K_NO_WAIT) != 0) {
 		/* In that case we should simply return */
 		LOG_DBG("%s_work unable to lock context", "process");
 		return;
@@ -252,18 +259,21 @@ static void sh_mqtt_process_handler(struct k_work *work)
 	       (sh_mqtt->transport_state == SHELL_MQTT_TRANSPORT_CONNECTED) &&
 	       (sh_mqtt->subscribe_state == SHELL_MQTT_SUBSCRIBED)) {
 		LOG_DBG("Listening to socket");
-		if (wait(remaining)) {
+		rc = wait(remaining);
+		if (rc > 0) {
 			LOG_DBG("Process socket for MQTT packet");
 			rc = mqtt_input(&sh_mqtt->mqtt_cli);
 			if (rc != 0) {
 				LOG_ERR("%s error: %d", "processed: mqtt_input", rc);
 				goto process_error;
 			}
+		} else if (rc < 0) {
+			goto process_error;
 		}
 
 		LOG_DBG("MQTT %s", "Keepalive");
 		rc = mqtt_live(&sh_mqtt->mqtt_cli);
-		if (rc != 0 && rc != -EAGAIN) {
+		if ((rc != 0) && (rc != -EAGAIN)) {
 			LOG_ERR("%s error: %d", "mqtt_live", rc);
 			goto process_error;
 		}
@@ -302,7 +312,7 @@ static void sh_mqtt_subscribe_handler(struct k_work *work)
 	}
 
 	/* If context can't be locked, that means net conn cb locked it */
-	if (sh_mqtt_context_lock(K_NO_WAIT)) {
+	if (sh_mqtt_context_lock(K_NO_WAIT) != 0) {
 		/* In that case we should simply return */
 		LOG_DBG("%s_work unable to lock context", "subscribe");
 		return;
@@ -317,13 +327,16 @@ static void sh_mqtt_subscribe_handler(struct k_work *work)
 	if (rc == 0) {
 		/* Wait for mqtt's connack */
 		LOG_DBG("Listening to socket");
-		if (wait(CONNECT_TIMEOUT_MS)) {
+		rc = wait(CONNECT_TIMEOUT_MS);
+		if (rc > 0) {
 			LOG_DBG("Process socket for MQTT packet");
 			rc = mqtt_input(&sh_mqtt->mqtt_cli);
 			if (rc != 0) {
 				LOG_ERR("%s error: %d", "subscribe: mqtt_input", rc);
 				goto subscribe_error;
 			}
+		} else if (rc < 0) {
+			goto subscribe_error;
 		}
 
 		/* No suback, fail */
@@ -360,7 +373,7 @@ static void sh_mqtt_connect_handler(struct k_work *work)
 	}
 
 	/* If context can't be locked, that means net conn cb locked it */
-	if (sh_mqtt_context_lock(K_NO_WAIT)) {
+	if (sh_mqtt_context_lock(K_NO_WAIT) != 0) {
 		/* In that case we should simply return */
 		LOG_DBG("%s_work unable to lock context", "connect");
 		return;
@@ -375,7 +388,7 @@ static void sh_mqtt_connect_handler(struct k_work *work)
 	/* Resolve the broker URL */
 	LOG_DBG("Resolving DNS");
 	rc = get_mqtt_broker_addrinfo();
-	if (rc) {
+	if (rc != 0) {
 		(void)sh_mqtt_work_reschedule(&sh_mqtt->connect_dwork, K_SECONDS(1));
 		sh_mqtt_context_unlock();
 		return;
@@ -399,13 +412,16 @@ static void sh_mqtt_connect_handler(struct k_work *work)
 
 	/* Wait for mqtt's connack */
 	LOG_DBG("Listening to socket");
-	if (wait(CONNECT_TIMEOUT_MS)) {
+	rc = wait(CONNECT_TIMEOUT_MS);
+	if (rc > 0) {
 		LOG_DBG("Process socket for MQTT packet");
 		rc = mqtt_input(&sh_mqtt->mqtt_cli);
 		if (rc != 0) {
 			LOG_ERR("%s error: %d", "connect: mqtt_input", rc);
 			goto connect_error;
 		}
+	} else if (rc < 0) {
+		goto connect_error;
 	}
 
 	/* No connack, fail */
@@ -499,13 +515,13 @@ static void net_disconnect_handler(struct k_work *work)
 static void network_evt_handler(struct net_mgmt_event_callback *cb, uint32_t mgmt_event,
 				struct net_if *iface)
 {
-	if (mgmt_event == NET_EVENT_L4_CONNECTED &&
-	    sh_mqtt->network_state == SHELL_MQTT_NETWORK_DISCONNECTED) {
+	if ((mgmt_event == NET_EVENT_L4_CONNECTED) &&
+	    (sh_mqtt->network_state == SHELL_MQTT_NETWORK_DISCONNECTED)) {
 		LOG_WRN("Network %s", "connected");
 		sh_mqtt->network_state = SHELL_MQTT_NETWORK_CONNECTED;
 		(void)sh_mqtt_work_reschedule(&sh_mqtt->connect_dwork, K_SECONDS(1));
-	} else if (mgmt_event == NET_EVENT_L4_DISCONNECTED &&
-		   sh_mqtt->network_state == SHELL_MQTT_NETWORK_CONNECTED) {
+	} else if ((mgmt_event == NET_EVENT_L4_DISCONNECTED) &&
+		   (sh_mqtt->network_state == SHELL_MQTT_NETWORK_CONNECTED)) {
 		(void)sh_mqtt_work_submit(&sh_mqtt->net_disconnected_work);
 	}
 }
@@ -548,7 +564,9 @@ static void mqtt_evt_handler(struct mqtt_client *const client, const struct mqtt
 
 	case MQTT_EVT_PUBLISH: {
 		const struct mqtt_publish_param *pub = &evt->param.publish;
-		uint32_t size, payload_left;
+		uint32_t payload_left;
+		size_t size;
+		int rc;
 
 		payload_left = pub->message.payload.len;
 
@@ -565,18 +583,19 @@ static void mqtt_evt_handler(struct mqtt_client *const client, const struct mqtt
 
 		while (payload_left > 0) {
 			/* Attempt to claim `payload_left` bytes of buffer in rb */
-			size = ring_buf_put_claim(&sh_mqtt->rx_rb, &sh_mqtt->rx_rb_ptr,
-						  payload_left);
+			size = (size_t)ring_buf_put_claim(&sh_mqtt->rx_rb, &sh_mqtt->rx_rb_ptr,
+							  payload_left);
 			/* Read `size` bytes of payload from mqtt */
-			size = mqtt_read_publish_payload_blocking(client, sh_mqtt->rx_rb_ptr, size);
+			rc = mqtt_read_publish_payload_blocking(client, sh_mqtt->rx_rb_ptr, size);
 
 			/* errno value, return */
-			if (size < 0) {
+			if (rc < 0) {
 				(void)ring_buf_put_finish(&sh_mqtt->rx_rb, 0U);
 				sh_mqtt_rx_rb_flush();
 				return;
 			}
 
+			size = (size_t)rc;
 			/* Indicate that `size` bytes of payload has been written into rb */
 			(void)ring_buf_put_finish(&sh_mqtt->rx_rb, size);
 			/* Update `payload_left` */
@@ -700,13 +719,13 @@ static int enable(const struct shell_transport *transport, bool blocking)
 
 	/* Listen for network connection status */
 	net_mgmt_add_event_callback(&sh_mqtt->mgmt_cb);
-	net_conn_mgr_resend_status();
+	conn_mgr_mon_resend_status();
 
 	return 0;
 }
 
-static int write(const struct shell_transport *transport, const void *data, size_t length,
-		 size_t *cnt)
+static int write_data(const struct shell_transport *transport, const void *data, size_t length,
+		      size_t *cnt)
 {
 	ARG_UNUSED(transport);
 	int rc = 0;
@@ -728,7 +747,7 @@ static int write(const struct shell_transport *transport, const void *data, size
 	(void)k_work_cancel_delayable_sync(&sh_mqtt->publish_dwork, &ws);
 
 	do {
-		if (sh_mqtt->tx_buf.len + length - *cnt > TX_BUF_SIZE) {
+		if ((sh_mqtt->tx_buf.len + length - *cnt) > TX_BUF_SIZE) {
 			copy_len = TX_BUF_SIZE - sh_mqtt->tx_buf.len;
 		} else {
 			copy_len = length - *cnt;
@@ -752,7 +771,7 @@ static int write(const struct shell_transport *transport, const void *data, size
 		*cnt += copy_len;
 	} while (*cnt < length);
 
-	if (sh_mqtt->tx_buf.len) {
+	if (sh_mqtt->tx_buf.len > 0) {
 		(void)sh_mqtt_work_reschedule(&sh_mqtt->publish_dwork, MQTT_SEND_DELAY_MS);
 	}
 
@@ -765,7 +784,8 @@ out:
 	return rc;
 }
 
-static int read(const struct shell_transport *transport, void *data, size_t length, size_t *cnt)
+static int read_data(const struct shell_transport *transport, void *data, size_t length,
+		     size_t *cnt)
 {
 	ARG_UNUSED(transport);
 
@@ -793,12 +813,11 @@ static int read(const struct shell_transport *transport, void *data, size_t leng
 const struct shell_transport_api shell_mqtt_transport_api = { .init = init,
 							      .uninit = uninit,
 							      .enable = enable,
-							      .write = write,
-							      .read = read };
+							      .write = write_data,
+							      .read = read_data };
 
-static int enable_shell_mqtt(const struct device *arg)
+static int enable_shell_mqtt(void)
 {
-	ARG_UNUSED(arg);
 
 	bool log_backend = CONFIG_SHELL_MQTT_INIT_LOG_LEVEL > 0;
 	uint32_t level = (CONFIG_SHELL_MQTT_INIT_LOG_LEVEL > LOG_LEVEL_DBG) ?

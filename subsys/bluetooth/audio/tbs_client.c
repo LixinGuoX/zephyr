@@ -1,84 +1,147 @@
 /*  Bluetooth TBS - Telephone Bearer Service - Client
  *
  * Copyright (c) 2020 Bose Corporation
- * Copyright (c) 2021 Nordic Semiconductor ASA
+ * Copyright (c) 2021-2024 Nordic Semiconductor ASA
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+#include <errno.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
 
-#include <zephyr/zephyr.h>
-#include <zephyr/types.h>
-#include <zephyr/sys/check.h>
-
-#include <zephyr/device.h>
-#include <zephyr/init.h>
-
+#include <zephyr/autoconf.h>
+#include <zephyr/bluetooth/att.h>
+#include <zephyr/bluetooth/audio/tbs.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/buf.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
-#include <zephyr/bluetooth/audio/tbs.h>
+#include <zephyr/bluetooth/uuid.h>
+#include <zephyr/init.h>
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/net_buf.h>
+#include <zephyr/sys/__assert.h>
+#include <zephyr/sys/atomic.h>
+#include <zephyr/sys/slist.h>
+#include <zephyr/sys/util.h>
+#include <zephyr/sys/util_macro.h>
+#include <zephyr/toolchain.h>
+#include <zephyr/types.h>
+#include <zephyr/sys/check.h>
 
 #include "tbs_internal.h"
 
-#define BT_DBG_ENABLED IS_ENABLED(CONFIG_BT_DEBUG_TBS_CLIENT)
-#define LOG_MODULE_NAME bt_tbs_client
-#include "common/log.h"
+LOG_MODULE_REGISTER(bt_tbs_client, CONFIG_BT_TBS_CLIENT_LOG_LEVEL);
+/* TODO TBS client attempts to subscribe to all characteristics at once if the MTU is large enough.
+ * This requires a significant amount of buffers, and should be optimized.
+ */
 
-#define MAX_URI_SCHEME_LIST_SIZE   64
-#if IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS)
-#define BT_TBS_INSTANCE_MAX_CNT    (CONFIG_BT_TBS_CLIENT_MAX_TBS_INSTANCES + 1)
-#else
-#define BT_TBS_INSTANCE_MAX_CNT    CONFIG_BT_TBS_CLIENT_MAX_TBS_INSTANCES
-#endif /* IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) */
-#define GTBS_INDEX                 CONFIG_BT_TBS_CLIENT_MAX_TBS_INSTANCES
+/* Calculate the required buffers for TBS Client discovery */
+#define TBS_CLIENT_BUF_COUNT                                                                       \
+	(1 /* Discover buffer */ + 1 /* terminate reason */ +                                      \
+	 IS_ENABLED(CONFIG_BT_TBS_CLIENT_BEARER_PROVIDER_NAME) +                                   \
+	 IS_ENABLED(CONFIG_BT_TBS_CLIENT_BEARER_TECHNOLOGY) +                                      \
+	 IS_ENABLED(CONFIG_BT_TBS_CLIENT_BEARER_SIGNAL_STRENGTH) +                                 \
+	 IS_ENABLED(CONFIG_BT_TBS_CLIENT_BEARER_LIST_CURRENT_CALLS) +                              \
+	 IS_ENABLED(CONFIG_BT_TBS_CLIENT_INCOMING_URI) +                                           \
+	 IS_ENABLED(CONFIG_BT_TBS_CLIENT_STATUS_FLAGS) +                                           \
+	 IS_ENABLED(CONFIG_BT_TBS_CLIENT_CP_PROCEDURES) +                                          \
+	 IS_ENABLED(CONFIG_BT_TBS_CLIENT_CALL_FRIENDLY_NAME) +                                     \
+	 IS_ENABLED(CONFIG_BT_TBS_CLIENT_INCOMING_CALL))
+
+BUILD_ASSERT(CONFIG_BT_ATT_TX_COUNT >= TBS_CLIENT_BUF_COUNT, "Too few ATT buffers");
+
+#include "common/bt_str.h"
 
 struct bt_tbs_server_inst {
-	struct bt_tbs_instance tbs_insts[BT_TBS_INSTANCE_MAX_CNT];
+#if defined(CONFIG_BT_TBS_CLIENT_TBS)
+	struct bt_tbs_instance tbs_insts[CONFIG_BT_TBS_CLIENT_MAX_TBS_INSTANCES];
+	uint8_t inst_cnt;
+#endif /* CONFIG_BT_TBS_CLIENT_TBS */
+#if defined(CONFIG_BT_TBS_CLIENT_GTBS)
+	struct bt_tbs_instance gtbs_inst;
+#endif /* defined(CONFIG_BT_TBS_CLIENT_GTBS) */
 	struct bt_gatt_discover_params discover_params;
 	struct bt_tbs_instance *current_inst;
-	uint8_t inst_cnt;
-	bool gtbs_found;
-	bool subscribe_all;
 };
 
-static const struct bt_tbs_client_cb *tbs_client_cbs;
+static sys_slist_t tbs_client_cbs = SYS_SLIST_STATIC_INIT(&tbs_client_cbs);
 
 static struct bt_tbs_server_inst srv_insts[CONFIG_BT_MAX_CONN];
-static const struct bt_uuid *tbs_uuid = BT_UUID_TBS;
-static const struct bt_uuid *gtbs_uuid = BT_UUID_GTBS;
 
-static void discover_next_instance(struct bt_conn *conn, uint8_t index);
+static void discover_next_instance(struct bt_conn *conn);
 
-static bool valid_inst_index(struct bt_conn *conn, uint8_t idx)
+typedef  bool (*tbs_instance_find_func_t)(struct bt_tbs_instance *inst, void *user_data);
+
+static struct bt_tbs_instance *tbs_instance_find(struct bt_tbs_server_inst *server,
+						 tbs_instance_find_func_t func, void *user_data)
 {
-	uint8_t conn_index;
-
-	__ASSERT(conn, "NULL conn");
-
-	conn_index = bt_conn_index(conn);
-
-	if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) && idx == BT_TBS_GTBS_INDEX) {
-		return true;
-	} else {
-		return idx < srv_insts[conn_index].inst_cnt;
+#if defined(CONFIG_BT_TBS_CLIENT_GTBS)
+		if (func(&server->gtbs_inst, user_data)) {
+			return &server->gtbs_inst;
+		}
+#endif /* CONFIG_BT_TBS_CLIENT_GTBS */
+#if defined(CONFIG_BT_TBS_CLIENT_TBS)
+	for (size_t i = 0; i < server->inst_cnt; i++) {
+		if (func(&server->tbs_insts[i], user_data)) {
+			return &server->tbs_insts[i];
+		}
 	}
+#endif /* CONFIG_BT_TBS_CLIENT_TBS */
+
+	return NULL;
 }
 
-static struct bt_tbs_instance *get_inst_by_index(struct bt_conn *conn,
-						 uint8_t idx)
+static struct bt_tbs_instance *tbs_inst_by_index(struct bt_conn *conn, uint8_t index)
 {
-	uint8_t conn_index;
+	struct bt_tbs_server_inst *server;
 
 	__ASSERT(conn, "NULL conn");
 
-	conn_index = bt_conn_index(conn);
+	server = &srv_insts[bt_conn_index(conn)];
 
-	if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) && idx == BT_TBS_GTBS_INDEX) {
-		return &srv_insts[conn_index].tbs_insts[GTBS_INDEX];
-	} else {
-		return &srv_insts[conn_index].tbs_insts[idx];
+#if defined(CONFIG_BT_TBS_CLIENT_GTBS)
+	if (index == BT_TBS_GTBS_INDEX) {
+		return &server->gtbs_inst;
 	}
+#endif /* CONFIG_BT_TBS_CLIENT_GTBS */
+#if defined(CONFIG_BT_TBS_CLIENT_TBS)
+	if (index < server->inst_cnt) {
+		return &server->tbs_insts[index];
+	}
+#endif /* CONFIG_BT_TBS_CLIENT_TBS */
+
+	return NULL;
+}
+
+static uint8_t tbs_index(struct bt_conn *conn, const struct bt_tbs_instance *inst)
+{
+	struct bt_tbs_server_inst *server;
+	ptrdiff_t index = 0;
+
+	__ASSERT_NO_MSG(conn);
+	__ASSERT_NO_MSG(inst);
+
+	server = &srv_insts[bt_conn_index(conn)];
+
+#if defined(CONFIG_BT_TBS_CLIENT_GTBS)
+	if (inst == &server->gtbs_inst) {
+		return BT_TBS_GTBS_INDEX;
+	}
+#endif /* CONFIG_BT_TBS_CLIENT_GTBS */
+#if defined(CONFIG_BT_TBS_CLIENT_TBS)
+	index = inst - server->tbs_insts;
+	__ASSERT(index >= 0 && index < ARRAY_SIZE(server->tbs_insts),
+		 "Invalid bt_tbs_instance pointer");
+
+#else
+	__ASSERT_PRINT("Invalid bt_tbs_instance pointer");
+#endif /* CONFIG_BT_TBS_CLIENT_TBS */
+
+	return (uint8_t)index;
 }
 
 #if defined(CONFIG_BT_TBS_CLIENT_ORIGINATE_CALL)
@@ -94,24 +157,31 @@ static bool free_call_spot(struct bt_tbs_instance *inst)
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_ORIGINATE_CALL) */
 
+static bool is_instance_handle(struct bt_tbs_instance *inst, void *user_data)
+{
+	uint16_t handle = POINTER_TO_UINT(user_data);
+
+	return inst->start_handle <= handle && inst->end_handle >= handle;
+}
+
 static struct bt_tbs_instance *lookup_inst_by_handle(struct bt_conn *conn,
 							 uint16_t handle)
 {
 	uint8_t conn_index;
 	struct bt_tbs_server_inst *srv_inst;
+	struct bt_tbs_instance *inst;
 
 	__ASSERT(conn, "NULL conn");
 
 	conn_index = bt_conn_index(conn);
 	srv_inst = &srv_insts[conn_index];
 
-	for (size_t i = 0; i < ARRAY_SIZE(srv_inst->tbs_insts); i++) {
-		if (srv_inst->tbs_insts[i].start_handle <= handle &&
-		    srv_inst->tbs_insts[i].end_handle >= handle) {
-			return &srv_inst->tbs_insts[i];
-		}
+	inst = tbs_instance_find(srv_inst, is_instance_handle, UINT_TO_POINTER(handle));
+	if (inst != NULL) {
+		return inst;
 	}
-	BT_DBG("Could not find instance with handle 0x%04x", handle);
+
+	LOG_DBG("Could not find instance with handle 0x%04x", handle);
 
 	return NULL;
 }
@@ -120,7 +190,7 @@ static uint8_t net_buf_pull_call_state(struct net_buf_simple *buf,
 				       struct bt_tbs_client_call_state *call_state)
 {
 	if (buf->len < sizeof(*call_state)) {
-		BT_DBG("Invalid buffer length %u", buf->len);
+		LOG_DBG("Invalid buffer length %u", buf->len);
 		return BT_ATT_ERR_INVALID_ATTRIBUTE_LEN;
 	}
 
@@ -145,7 +215,7 @@ static uint8_t net_buf_pull_call(struct net_buf_simple *buf,
 	__ASSERT(call, "NULL call");
 
 	if (buf->len < sizeof(item_len) + min_item_len) {
-		BT_DBG("Invalid buffer length %u", buf->len);
+		LOG_DBG("Invalid buffer length %u", buf->len);
 		return BT_ATT_ERR_INVALID_ATTRIBUTE_LEN;
 	}
 
@@ -153,7 +223,7 @@ static uint8_t net_buf_pull_call(struct net_buf_simple *buf,
 	uri_len = item_len - sizeof(call->call_info);
 
 	if (item_len > buf->len || item_len < min_item_len) {
-		BT_DBG("Invalid current call item length %u", item_len);
+		LOG_DBG("Invalid current call item length %u", item_len);
 		return BT_ATT_ERR_INVALID_ATTRIBUTE_LEN;
 	}
 
@@ -163,10 +233,9 @@ static uint8_t net_buf_pull_call(struct net_buf_simple *buf,
 	}
 
 	uri = net_buf_simple_pull_mem(buf, uri_len);
-	if (uri_len > sizeof(call->remote_uri) - 1) {
-		BT_WARN("Current call (index %u) uri length larger than supported %u/%zu",
-			call->call_info.index, uri_len,
-			sizeof(call->remote_uri) - 1);
+	if (uri_len > CONFIG_BT_TBS_MAX_URI_LENGTH) {
+		LOG_WRN("Current call (index %u) uri length larger than supported %u/%zu",
+			call->call_info.index, uri_len, CONFIG_BT_TBS_MAX_URI_LENGTH);
 		return BT_ATT_ERR_INSUFFICIENT_RESOURCES;
 	}
 
@@ -175,6 +244,52 @@ static uint8_t net_buf_pull_call(struct net_buf_simple *buf,
 
 	return 0;
 }
+
+static void current_calls_changed(struct bt_conn *conn, int err, uint8_t inst_index,
+				  uint8_t call_count, const struct bt_tbs_client_call *calls)
+{
+	struct bt_tbs_client_cb *listener, *next;
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&tbs_client_cbs, listener, next, _node) {
+		if (listener->current_calls != NULL) {
+			listener->current_calls(conn, err, inst_index, call_count, calls);
+		}
+	}
+}
+
+static void bearer_list_current_calls(struct bt_conn *conn, const struct bt_tbs_instance *inst,
+				      struct net_buf_simple *buf)
+{
+	struct bt_tbs_client_call calls[CONFIG_BT_TBS_CLIENT_MAX_CALLS];
+	char remote_uris[CONFIG_BT_TBS_CLIENT_MAX_CALLS][CONFIG_BT_TBS_MAX_URI_LENGTH + 1];
+	uint8_t cnt = 0;
+	int err;
+
+	while (buf->len) {
+		struct bt_tbs_client_call *call;
+
+		if (cnt == CONFIG_BT_TBS_CLIENT_MAX_CALLS) {
+			LOG_WRN("Could not parse all calls due to memory restrictions");
+			break;
+		}
+
+		call = &calls[cnt];
+		call->remote_uri = remote_uris[cnt];
+
+		err = net_buf_pull_call(buf, call);
+		if (err == BT_ATT_ERR_INSUFFICIENT_RESOURCES) {
+			LOG_WRN("Call with skipped due to too long URI");
+			continue;
+		} else if (err != 0) {
+			LOG_DBG("Invalid current call notification: %d", err);
+			return;
+		}
+
+		cnt++;
+	}
+
+	current_calls_changed(conn, 0, tbs_index(conn, inst), cnt, calls);
+}
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_LIST_CURRENT_CALLS) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_CP_PROCEDURES)
@@ -182,52 +297,58 @@ static void call_cp_callback_handler(struct bt_conn *conn, int err,
 				     uint8_t index, uint8_t opcode,
 				     uint8_t call_index)
 {
-	bt_tbs_client_cp_cb cp_cb = NULL;
+	struct bt_tbs_client_cb *listener, *next;
 
-	BT_DBG("Status: %s for the %s opcode for call 0x%02x",
-	       bt_tbs_status_str(err), bt_tbs_opcode_str(opcode), call_index);
+	LOG_DBG("Status: %s for the %s opcode for call 0x%02x", bt_tbs_status_str(err),
+		bt_tbs_opcode_str(opcode), call_index);
 
-	if (tbs_client_cbs == NULL) {
-		return;
-	}
-
-	switch (opcode) {
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&tbs_client_cbs, listener, next, _node) {
+		switch (opcode) {
 #if defined(CONFIG_BT_TBS_CLIENT_ACCEPT_CALL)
-	case BT_TBS_CALL_OPCODE_ACCEPT:
-		cp_cb = tbs_client_cbs->accept_call;
-		break;
+		case BT_TBS_CALL_OPCODE_ACCEPT:
+			if (listener->accept_call != NULL) {
+				listener->accept_call(conn, err, index, call_index);
+			}
+			break;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_ACCEPT_CALL) */
 #if defined(CONFIG_BT_TBS_CLIENT_TERMINATE_CALL)
-	case BT_TBS_CALL_OPCODE_TERMINATE:
-		cp_cb = tbs_client_cbs->terminate_call;
-		break;
+		case BT_TBS_CALL_OPCODE_TERMINATE:
+			if (listener->terminate_call != NULL) {
+				listener->terminate_call(conn, err, index, call_index);
+			}
+			break;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_TERMINATE_CALL) */
 #if defined(CONFIG_BT_TBS_CLIENT_HOLD_CALL)
-	case BT_TBS_CALL_OPCODE_HOLD:
-		cp_cb = tbs_client_cbs->hold_call;
-		break;
+		case BT_TBS_CALL_OPCODE_HOLD:
+			if (listener->hold_call != NULL) {
+				listener->hold_call(conn, err, index, call_index);
+			}
+			break;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_HOLD_CALL) */
 #if defined(CONFIG_BT_TBS_CLIENT_RETRIEVE_CALL)
-	case BT_TBS_CALL_OPCODE_RETRIEVE:
-		cp_cb = tbs_client_cbs->retrieve_call;
-		break;
+		case BT_TBS_CALL_OPCODE_RETRIEVE:
+			if (listener->retrieve_call != NULL) {
+				listener->retrieve_call(conn, err, index, call_index);
+			}
+			break;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_RETRIEVE_CALL) */
 #if defined(CONFIG_BT_TBS_CLIENT_ORIGINATE_CALL)
-	case BT_TBS_CALL_OPCODE_ORIGINATE:
-		cp_cb = tbs_client_cbs->originate_call;
-		break;
+		case BT_TBS_CALL_OPCODE_ORIGINATE:
+			if (listener->originate_call != NULL) {
+				listener->originate_call(conn, err, index, call_index);
+			}
+			break;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_ORIGINATE_CALL) */
 #if defined(CONFIG_BT_TBS_CLIENT_JOIN_CALLS)
-	case BT_TBS_CALL_OPCODE_JOIN:
-		cp_cb = tbs_client_cbs->join_calls;
-		break;
+		case BT_TBS_CALL_OPCODE_JOIN:
+			if (listener->join_calls != NULL) {
+				listener->join_calls(conn, err, index, call_index);
+			}
+			break;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_JOIN_CALLS) */
-	default:
-		break;
-	}
-
-	if (cp_cb != 0) {
-		cp_cb(conn, err, index, call_index);
+		default:
+			break;
+		}
 	}
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_OPTIONAL_OPCODES) */
@@ -248,6 +369,18 @@ const char *parse_string_value(const void *data, uint16_t length,
 }
 
 #if defined(CONFIG_BT_TBS_CLIENT_BEARER_PROVIDER_NAME)
+static void provider_name_changed(struct bt_conn *conn, int err, uint8_t inst_index,
+				  const char *name)
+{
+	struct bt_tbs_client_cb *listener, *next;
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&tbs_client_cbs, listener, next, _node) {
+		if (listener->bearer_provider_name != NULL) {
+			listener->bearer_provider_name(conn, err, inst_index, name);
+		}
+	}
+}
+
 static void provider_name_notify_handler(struct bt_conn *conn,
 					 const struct bt_tbs_instance *tbs_inst,
 					 const void *data, uint16_t length)
@@ -255,53 +388,68 @@ static void provider_name_notify_handler(struct bt_conn *conn,
 	const char *name = parse_string_value(data, length,
 					      CONFIG_BT_TBS_MAX_PROVIDER_NAME_LENGTH);
 
-	BT_DBG("%s", name);
+	LOG_DBG("%s", name);
 
-	if (tbs_client_cbs != NULL && tbs_client_cbs->bearer_provider_name != NULL) {
-		tbs_client_cbs->bearer_provider_name(conn, 0, tbs_inst->index, name);
-	}
+	provider_name_changed(conn, 0, tbs_index(conn, tbs_inst), name);
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_PROVIDER_NAME) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_BEARER_TECHNOLOGY)
+static void technology_changed(struct bt_conn *conn, int err, uint8_t inst_index,
+			       uint8_t technology)
+{
+	struct bt_tbs_client_cb *listener, *next;
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&tbs_client_cbs, listener, next, _node) {
+		if (listener->technology != NULL) {
+			listener->technology(conn, err, inst_index, technology);
+		}
+	}
+}
+
 static void technology_notify_handler(struct bt_conn *conn,
 				      const struct bt_tbs_instance *tbs_inst,
 				      const void *data, uint16_t length)
 {
 	uint8_t technology;
 
-	BT_DBG("");
+	LOG_DBG("");
 
 	if (length == sizeof(technology)) {
 		(void)memcpy(&technology, data, length);
-		BT_DBG("%s (0x%02x)",
-		       bt_tbs_technology_str(technology), technology);
+		LOG_DBG("%s (0x%02x)", bt_tbs_technology_str(technology), technology);
 
-		if (tbs_client_cbs != NULL && tbs_client_cbs->technology != NULL) {
-			tbs_client_cbs->technology(conn, 0, tbs_inst->index,
-					    technology);
-		}
+		technology_changed(conn, 0, tbs_index(conn, tbs_inst), technology);
 	}
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_TECHNOLOGY) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_BEARER_SIGNAL_STRENGTH)
+static void signal_strength_changed(struct bt_conn *conn, int err, uint8_t inst_index,
+				    uint8_t signal_strength)
+{
+	struct bt_tbs_client_cb *listener, *next;
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&tbs_client_cbs, listener, next, _node) {
+		if (listener->signal_strength != NULL) {
+			listener->signal_strength(conn, err, inst_index, signal_strength);
+		}
+	}
+}
+
 static void signal_strength_notify_handler(struct bt_conn *conn,
 					   const struct bt_tbs_instance *tbs_inst,
 					   const void *data, uint16_t length)
 {
 	uint8_t signal_strength;
 
-	BT_DBG("");
+	LOG_DBG("");
 
 	if (length == sizeof(signal_strength)) {
 		(void)memcpy(&signal_strength, data, length);
-		BT_DBG("0x%02x", signal_strength);
+		LOG_DBG("0x%02x", signal_strength);
 
-		if (tbs_client_cbs != NULL && tbs_client_cbs->signal_strength != NULL) {
-			tbs_client_cbs->signal_strength(conn, 0, tbs_inst->index,
-						 signal_strength);
-		}
+		signal_strength_changed(conn, 0, tbs_index(conn, tbs_inst), signal_strength);
 	}
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_SIGNAL_STRENGTH) */
@@ -311,63 +459,61 @@ static void current_calls_notify_handler(struct bt_conn *conn,
 					 const struct bt_tbs_instance *tbs_inst,
 					 const void *data, uint16_t length)
 {
-	struct bt_tbs_client_call calls[CONFIG_BT_TBS_CLIENT_MAX_CALLS];
-	uint8_t cnt = 0;
 	struct net_buf_simple buf;
 
-	BT_DBG("");
+	LOG_DBG("");
 
 	net_buf_simple_init_with_data(&buf, (void *)data, length);
 
 	/* TODO: If length == MTU, do long read for all calls */
 
-	while (buf.len) {
-		struct bt_tbs_client_call *call = &calls[cnt];
-		int err;
-
-		err = net_buf_pull_call(&buf, call);
-		if (err == BT_ATT_ERR_INSUFFICIENT_RESOURCES) {
-			BT_WARN("Call with skipped due to too long URI");
-			continue;
-		} else if (err != 0) {
-			BT_DBG("Invalid current call notification: %d", err);
-			return;
-		}
-
-		cnt++;
-		if (cnt == CONFIG_BT_TBS_CLIENT_MAX_CALLS) {
-			BT_WARN("Could not parse all calls due to memory restrictions");
-			break;
-		}
-	}
-
-	if (tbs_client_cbs != NULL && tbs_client_cbs->current_calls != NULL) {
-		tbs_client_cbs->current_calls(conn, 0, tbs_inst->index, cnt, calls);
-	}
+	bearer_list_current_calls(conn, tbs_inst, &buf);
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_LIST_CURRENT_CALLS) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_STATUS_FLAGS)
+static void status_flags_changed(struct bt_conn *conn, int err, uint8_t inst_index,
+				 uint16_t status_flags)
+{
+	struct bt_tbs_client_cb *listener, *next;
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&tbs_client_cbs, listener, next, _node) {
+		if (listener->status_flags != NULL) {
+			listener->status_flags(conn, err, inst_index, status_flags);
+		}
+	}
+}
+
 static void status_flags_notify_handler(struct bt_conn *conn,
 					const struct bt_tbs_instance *tbs_inst,
 					const void *data, uint16_t length)
 {
 	uint16_t status_flags;
 
-	BT_DBG("");
+	LOG_DBG("");
 
 	if (length == sizeof(status_flags)) {
 		(void)memcpy(&status_flags, data, length);
-		BT_DBG("0x%04x", status_flags);
-		if (tbs_client_cbs != NULL && tbs_client_cbs->status_flags != NULL) {
-			tbs_client_cbs->status_flags(conn, 0, tbs_inst->index,
-					      status_flags);
-		}
+		LOG_DBG("0x%04x", status_flags);
+
+		status_flags_changed(conn, 0, tbs_index(conn, tbs_inst), status_flags);
 	}
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_STATUS_FLAGS) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_INCOMING_URI)
+static void call_uri_changed(struct bt_conn *conn, int err, uint8_t inst_index,
+			     const char *call_uri)
+{
+	struct bt_tbs_client_cb *listener, *next;
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&tbs_client_cbs, listener, next, _node) {
+		if (listener->call_uri != NULL) {
+			listener->call_uri(conn, err, inst_index, call_uri);
+		}
+	}
+}
+
 static void incoming_uri_notify_handler(struct bt_conn *conn,
 					const struct bt_tbs_instance *tbs_inst,
 					const void *data, uint16_t length)
@@ -375,13 +521,24 @@ static void incoming_uri_notify_handler(struct bt_conn *conn,
 	const char *uri = parse_string_value(data, length,
 					     CONFIG_BT_TBS_MAX_URI_LENGTH);
 
-	BT_DBG("%s", uri);
+	LOG_DBG("%s", uri);
 
-	if (tbs_client_cbs != NULL && tbs_client_cbs->call_uri != NULL) {
-		tbs_client_cbs->call_uri(conn, 0, tbs_inst->index, uri);
-	}
+	call_uri_changed(conn, 0, tbs_index(conn, tbs_inst), uri);
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_INCOMING_URI) */
+
+static void call_state_changed(struct bt_conn *conn, int err, uint8_t inst_index,
+			       uint8_t call_count,
+			       const struct bt_tbs_client_call_state *call_states)
+{
+	struct bt_tbs_client_cb *listener, *next;
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&tbs_client_cbs, listener, next, _node) {
+		if (listener->call_state != NULL) {
+			listener->call_state(conn, err, inst_index, call_count, call_states);
+		}
+	}
+}
 
 static void call_state_notify_handler(struct bt_conn *conn,
 				      const struct bt_tbs_instance *tbs_inst,
@@ -391,32 +548,33 @@ static void call_state_notify_handler(struct bt_conn *conn,
 	uint8_t cnt = 0;
 	struct net_buf_simple buf;
 
-	BT_DBG("");
+	LOG_DBG("");
 
 	net_buf_simple_init_with_data(&buf, (void *)data, length);
 
 	/* TODO: If length == MTU, do long read for all call states */
 
 	while (buf.len) {
-		struct bt_tbs_client_call_state *call_state = &call_states[cnt];
+		struct bt_tbs_client_call_state *call_state;
 		int err;
+
+		if (cnt == CONFIG_BT_TBS_CLIENT_MAX_CALLS) {
+			LOG_WRN("Could not parse all calls due to memory restrictions");
+			break;
+		}
+
+		call_state = &call_states[cnt];
 
 		err = net_buf_pull_call_state(&buf, call_state);
 		if (err != 0) {
-			BT_DBG("Invalid current call notification: %d", err);
+			LOG_DBG("Invalid current call notification: %d", err);
 			return;
 		}
 
 		cnt++;
-		if (cnt == CONFIG_BT_TBS_CLIENT_MAX_CALLS) {
-			BT_WARN("Could not parse all calls due to memory restrictions");
-			break;
-		}
 	}
 
-	if (tbs_client_cbs != NULL && tbs_client_cbs->call_state != NULL) {
-		tbs_client_cbs->call_state(conn, 0, tbs_inst->index, cnt, call_states);
-	}
+	call_state_changed(conn, 0, tbs_index(conn, tbs_inst), cnt, call_states);
 }
 
 #if defined(CONFIG_BT_TBS_CLIENT_CP_PROCEDURES)
@@ -426,20 +584,32 @@ static void call_cp_notify_handler(struct bt_conn *conn,
 {
 	struct bt_tbs_call_cp_notify *ind_val;
 
-	BT_DBG("");
+	LOG_DBG("");
 
 	if (length == sizeof(*ind_val)) {
 		ind_val = (struct bt_tbs_call_cp_notify *)data;
-		BT_DBG("Status: %s for the %s opcode for call 0x%02X",
-		       bt_tbs_status_str(ind_val->status),
-		       bt_tbs_opcode_str(ind_val->opcode),
-		       ind_val->call_index);
+		LOG_DBG("Status: %s for the %s opcode for call 0x%02X",
+			bt_tbs_status_str(ind_val->status), bt_tbs_opcode_str(ind_val->opcode),
+			ind_val->call_index);
 
-		call_cp_callback_handler(conn, ind_val->status, tbs_inst->index,
+		call_cp_callback_handler(conn, ind_val->status, tbs_index(conn, tbs_inst),
 					 ind_val->opcode, ind_val->call_index);
 	}
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_CP_PROCEDURES) */
+
+static void terminate_reason_changed(struct bt_conn *conn, int err, uint8_t inst_index,
+				     struct bt_tbs_terminate_reason reason)
+{
+	struct bt_tbs_client_cb *listener, *next;
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&tbs_client_cbs, listener, next, _node) {
+		if (listener->termination_reason != NULL) {
+			listener->termination_reason(conn, err, inst_index, reason.call_index,
+						     reason.reason);
+		}
+	}
+}
 
 static void termination_reason_notify_handler(struct bt_conn *conn,
 					      const struct bt_tbs_instance *tbs_inst,
@@ -447,23 +617,30 @@ static void termination_reason_notify_handler(struct bt_conn *conn,
 {
 	struct bt_tbs_terminate_reason reason;
 
-	BT_DBG("");
+	LOG_DBG("");
 
 	if (length == sizeof(reason)) {
 		(void)memcpy(&reason, data, length);
-		BT_DBG("ID 0x%02X, reason %s",
-		       reason.call_index,
-		       bt_tbs_term_reason_str(reason.reason));
+		LOG_DBG("ID 0x%02X, reason %s", reason.call_index,
+			bt_tbs_term_reason_str(reason.reason));
 
-		if (tbs_client_cbs != NULL && tbs_client_cbs->termination_reason != NULL) {
-			tbs_client_cbs->termination_reason(conn, 0, tbs_inst->index,
-						    reason.call_index,
-						    reason.reason);
-		}
+		terminate_reason_changed(conn, 0, tbs_index(conn, tbs_inst), reason);
 	}
 }
 
 #if defined(CONFIG_BT_TBS_CLIENT_INCOMING_CALL)
+static void remote_uri_changed(struct bt_conn *conn, int err, uint8_t inst_index,
+			       const char *remote_uri)
+{
+	struct bt_tbs_client_cb *listener, *next;
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&tbs_client_cbs, listener, next, _node) {
+		if (listener->remote_uri != NULL) {
+			listener->remote_uri(conn, err, inst_index, remote_uri);
+		}
+	}
+}
+
 static void in_call_notify_handler(struct bt_conn *conn,
 				   const struct bt_tbs_instance *tbs_inst,
 				   const void *data, uint16_t length)
@@ -471,15 +648,25 @@ static void in_call_notify_handler(struct bt_conn *conn,
 	const char *uri = parse_string_value(data, length,
 					     CONFIG_BT_TBS_MAX_URI_LENGTH);
 
-	BT_DBG("%s", uri);
+	LOG_DBG("%s", uri);
 
-	if (tbs_client_cbs != NULL && tbs_client_cbs->remote_uri != NULL) {
-		tbs_client_cbs->remote_uri(conn, 0, tbs_inst->index, uri);
-	}
+	remote_uri_changed(conn, 0, tbs_index(conn, tbs_inst), uri);
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_INCOMING_CALL) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_CALL_FRIENDLY_NAME)
+static void friendly_name_changed(struct bt_conn *conn, int err, uint8_t inst_index,
+				  const char *friendly_name)
+{
+	struct bt_tbs_client_cb *listener, *next;
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&tbs_client_cbs, listener, next, _node) {
+		if (listener->friendly_name != NULL) {
+			listener->friendly_name(conn, err, inst_index, friendly_name);
+		}
+	}
+}
+
 static void friendly_name_notify_handler(struct bt_conn *conn,
 					 const struct bt_tbs_instance *tbs_inst,
 					 const void *data, uint16_t length)
@@ -487,11 +674,9 @@ static void friendly_name_notify_handler(struct bt_conn *conn,
 	const char *name = parse_string_value(data, length,
 					      CONFIG_BT_TBS_MAX_URI_LENGTH);
 
-	BT_DBG("%s", name);
+	LOG_DBG("%s", name);
 
-	if (tbs_client_cbs != NULL && tbs_client_cbs->friendly_name != NULL) {
-		tbs_client_cbs->friendly_name(conn, 0, tbs_inst->index, name);
-	}
+	friendly_name_changed(conn, 0, tbs_index(conn, tbs_inst), name);
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_CALL_FRIENDLY_NAME) */
 
@@ -501,26 +686,22 @@ static uint8_t notify_handler(struct bt_conn *conn,
 			      const void *data, uint16_t length)
 {
 	uint16_t handle = params->value_handle;
-	struct bt_tbs_instance *tbs_inst = lookup_inst_by_handle(conn, handle);
+	struct bt_tbs_instance *tbs_inst;
 
-	if (data == NULL) {
-		BT_DBG("[UNSUBSCRIBED] 0x%04X", params->value_handle);
+	if (data == NULL || conn == NULL) {
+		LOG_DBG("[UNSUBSCRIBED] 0x%04X", params->value_handle);
 		params->value_handle = 0U;
-		if (tbs_inst != NULL) {
-			tbs_inst->subscribe_cnt--;
-		}
 
 		return BT_GATT_ITER_STOP;
 	}
 
+	tbs_inst = lookup_inst_by_handle(conn, handle);
 	if (tbs_inst != NULL) {
-		if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) && tbs_inst->gtbs) {
-			BT_DBG("GTBS");
-		} else {
-			BT_DBG("Index %u", tbs_inst->index);
-		}
+		uint8_t inst_index = tbs_index(conn, tbs_inst);
 
-		BT_HEXDUMP_DBG(data, length, "notify handler value");
+		LOG_DBG("Index %u", inst_index);
+
+		LOG_HEXDUMP_DBG(data, length, "notify handler value");
 
 		if (handle == tbs_inst->call_state_sub_params.value_handle) {
 			call_state_notify_handler(conn, tbs_inst, data, length);
@@ -571,11 +752,160 @@ static uint8_t notify_handler(struct bt_conn *conn,
 #endif /* defined(CONFIG_BT_TBS_CLIENT_CALL_FRIENDLY_NAME) */
 		}
 	} else {
-		BT_DBG("Notification/Indication on unknown TBS inst");
+		LOG_DBG("Notification/Indication on unknown TBS inst");
 	}
 
 	return BT_GATT_ITER_CONTINUE;
 }
+
+static void initialize_net_buf_read_buffer(struct bt_tbs_instance *inst)
+{
+	net_buf_simple_init_with_data(&inst->net_buf, &inst->read_buf,
+				      sizeof(inst->read_buf));
+	net_buf_simple_reset(&inst->net_buf);
+}
+
+static void tbs_client_gatt_read_complete(struct bt_tbs_instance *inst)
+{
+	(void)memset(&inst->read_params, 0, sizeof(inst->read_params));
+	atomic_clear_bit(inst->flags, BT_TBS_CLIENT_FLAG_BUSY);
+}
+
+static int tbs_client_gatt_read(struct bt_conn *conn, struct bt_tbs_instance *inst, uint16_t handle,
+				bt_gatt_read_func_t func)
+{
+	int err;
+
+	if (atomic_test_and_set_bit(inst->flags, BT_TBS_CLIENT_FLAG_BUSY)) {
+		LOG_DBG("Instance is busy");
+
+		return -EBUSY;
+	}
+
+	/* Use read_buf; length may be larger than minimum BT_ATT_MTU */
+	initialize_net_buf_read_buffer(inst);
+	inst->read_params.func = func;
+	inst->read_params.handle_count = 1U;
+	inst->read_params.single.handle = handle;
+	inst->read_params.single.offset = 0U;
+
+	err = bt_gatt_read(conn, &inst->read_params);
+	if (err != 0) {
+		tbs_client_gatt_read_complete(inst);
+
+		return err;
+	}
+
+	return 0;
+}
+
+static bool gtbs_found(struct bt_tbs_server_inst *srv_inst)
+{
+#if defined(CONFIG_BT_TBS_CLIENT_GTBS)
+	return srv_inst->gtbs_inst.start_handle != 0;
+#else
+	return false;
+#endif /* CONFIG_BT_TBS_CLIENT_GTBS */
+}
+
+static uint8_t inst_cnt(struct bt_tbs_server_inst *srv_inst)
+{
+#if defined(CONFIG_BT_TBS_CLIENT_TBS)
+	return srv_inst->inst_cnt;
+#else
+	return 0;
+#endif /* CONFIG_BT_TBS_CLIENT_TBS */
+}
+
+static void tbs_client_discover_complete(struct bt_conn *conn, int err)
+{
+	struct bt_tbs_server_inst *srv_inst = &srv_insts[bt_conn_index(conn)];
+	struct bt_tbs_client_cb *listener, *next;
+
+	LOG_DBG("conn %p err %d", (void *)conn, err);
+
+	/* Clear the current instance in discovery */
+	srv_inst->current_inst = NULL;
+
+#if defined(CONFIG_BT_TBS_CLIENT_GTBS)
+	atomic_clear_bit(srv_inst->gtbs_inst.flags, BT_TBS_CLIENT_FLAG_BUSY);
+#endif /* CONFIG_BT_TBS_CLIENT_GTBS */
+#if defined(CONFIG_BT_TBS_CLIENT_TBS)
+	for (size_t i = 0U; i < ARRAY_SIZE(srv_inst->tbs_insts); i++) {
+		atomic_clear_bit(srv_inst->tbs_insts[i].flags, BT_TBS_CLIENT_FLAG_BUSY);
+	}
+#endif /* CONFIG_BT_TBS_CLIENT_TBS */
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&tbs_client_cbs, listener, next, _node) {
+		if (listener->discover != NULL) {
+			listener->discover(conn, err, inst_cnt(srv_inst), gtbs_found(srv_inst));
+		}
+	}
+}
+
+#if defined(CONFIG_BT_TBS_CLIENT_BEARER_PROVIDER_NAME) ||                                          \
+	defined(CONFIG_BT_TBS_CLIENT_BEARER_UCI) ||                                                \
+	defined(CONFIG_BT_TBS_CLIENT_BEARER_URI_SCHEMES_SUPPORTED_LIST) ||                         \
+	defined(CONFIG_BT_TBS_CLIENT_INCOMING_URI) ||                                              \
+	defined(CONFIG_BT_TBS_CLIENT_INCOMING_CALL) ||                                             \
+	defined(CONFIG_BT_TBS_CLIENT_CALL_FRIENDLY_NAME)
+
+static bool can_add_string_to_net_buf(const struct net_buf_simple *buf, size_t len)
+{
+	return buf->len + len + sizeof('\0') <= buf->size;
+}
+
+/**
+ * Common function to read tbs_client strings which may require long reads
+ *
+ * @return BT_GATT_ITER_CONTINUE, BT_GATT_ITER_STOP or a negative value if there's an error
+ */
+static int handle_string_long_read(struct bt_tbs_instance *inst, uint8_t err, const void *data,
+				   uint16_t offset, uint16_t length, bool truncatable)
+{
+	if (err != 0) {
+		LOG_DBG("err: %u", err);
+
+		return BT_GATT_ERR(err);
+	}
+
+	if (data != NULL) {
+		/* Get data and try to read more using read long procedure */
+		LOG_DBG("Read (offset %u): %s", offset, bt_hex(data, length));
+
+		if (!can_add_string_to_net_buf(&inst->net_buf, length)) {
+			LOG_DBG("Read length %u: String buffer full", length);
+			if (truncatable) {
+				/* Use the remaining buffer and stop reading and leave room for NULL
+				 * terminator
+				 */
+				LOG_DBG("Truncating string");
+				length = net_buf_simple_tailroom(&inst->net_buf) - sizeof('\0');
+				net_buf_simple_add_mem(&inst->net_buf, data, length);
+
+				/* Ensure that the data is correctly truncated */
+				utf8_trunc(inst->net_buf.data);
+			} else {
+				return BT_GATT_ERR(BT_ATT_ERR_INSUFFICIENT_RESOURCES);
+			}
+		} else {
+			net_buf_simple_add_mem(&inst->net_buf, data, length);
+
+			return BT_GATT_ITER_CONTINUE;
+		}
+	} /* else we are done reading and since the buffer is always 0-initialized, it will have the
+	   *  NULL terminator automatically
+	   */
+
+	return BT_GATT_ITER_STOP;
+}
+#endif /* CONFIG_BT_TBS_CLIENT_BEARER_PROVIDER_NAME ||                                             \
+	* CONFIG_BT_TBS_CLIENT_BEARER_UCI ||                                                       \
+	* CONFIG_BT_TBS_CLIENT_BEARER_URI_SCHEMES_SUPPORTED_LIST ||                                \
+	* CONFIG_BT_TBS_CLIENT_INCOMING_URI ||                                                     \
+	* CONFIG_BT_TBS_CLIENT_INCOMING_CALL ||                                                    \
+	* CONFIG_BT_TBS_CLIENT_CALL_FRIENDLY_NAME                                                  \
+	*/
 
 #if defined(CONFIG_BT_TBS_CLIENT_CP_PROCEDURES)
 static int tbs_client_common_call_control(struct bt_conn *conn,
@@ -583,15 +913,16 @@ static int tbs_client_common_call_control(struct bt_conn *conn,
 					  uint8_t call_index,
 					  uint8_t opcode)
 {
-	const struct bt_tbs_instance *inst = get_inst_by_index(conn, inst_index);
+	struct bt_tbs_instance *inst;
 	struct bt_tbs_call_cp_acc common;
 
+	inst = tbs_inst_by_index(conn, inst_index);
 	if (inst == NULL) {
 		return -EINVAL;
 	}
 
 	if (inst->call_cp_sub_params.value_handle == 0) {
-		BT_DBG("Handle not set");
+		LOG_DBG("Handle not set");
 		return -EINVAL;
 	}
 
@@ -609,73 +940,66 @@ static uint8_t read_bearer_provider_name_cb(struct bt_conn *conn, uint8_t err,
 					    const void *data, uint16_t length)
 {
 	struct bt_tbs_instance *inst = CONTAINER_OF(params, struct bt_tbs_instance, read_params);
+	const uint8_t inst_index = tbs_index(conn, inst);
+	int ret;
 
-	(void)memset(params, 0, sizeof(*params));
+	LOG_DBG("");
 
-	if (inst != NULL) {
-		const char *provider_name = NULL;
-
-		if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) && inst->gtbs) {
-			BT_DBG("GTBS");
+	ret = handle_string_long_read(inst, err, data, params->single.offset, length, true);
+	if (ret != BT_GATT_ITER_CONTINUE) {
+		if (ret == BT_GATT_ITER_STOP) {
+			/* At this point the inst->net_buf.data contains a NULL terminator string */
+			provider_name_changed(conn, 0, inst_index, (char *)inst->net_buf.data);
 		} else {
-			BT_DBG("Index %u", inst->index);
+			provider_name_changed(conn, ret, inst_index, NULL);
 		}
 
-		if (err != 0) {
-			BT_DBG("err: 0x%02X", err);
-		} else if (data != NULL) {
-			provider_name =
-				parse_string_value(data, length,
-					CONFIG_BT_TBS_MAX_PROVIDER_NAME_LENGTH);
-			BT_DBG("%s", provider_name);
-		}
+		tbs_client_gatt_read_complete(inst);
 
-		inst->busy = false;
-
-		if (tbs_client_cbs != NULL && tbs_client_cbs->bearer_provider_name != NULL) {
-			tbs_client_cbs->bearer_provider_name(conn, err, inst->index,
-						      provider_name);
-		}
+		return BT_GATT_ITER_STOP;
 	}
 
-	return BT_GATT_ITER_STOP;
+	return BT_GATT_ITER_CONTINUE;
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_PROVIDER_NAME) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_BEARER_UCI)
+static void bearer_uci_changed(struct bt_conn *conn, int err, uint8_t inst_index, const char *uci)
+{
+	struct bt_tbs_client_cb *listener, *next;
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&tbs_client_cbs, listener, next, _node) {
+		if (listener->bearer_uci != NULL) {
+			listener->bearer_uci(conn, err, inst_index, uci);
+		}
+	}
+}
+
 static uint8_t read_bearer_uci_cb(struct bt_conn *conn, uint8_t err,
 				   struct bt_gatt_read_params *params,
 				   const void *data, uint16_t length)
 {
 	struct bt_tbs_instance *inst = CONTAINER_OF(params, struct bt_tbs_instance, read_params);
+	const uint8_t inst_index = tbs_index(conn, inst);
+	int ret;
 
-	(void)memset(params, 0, sizeof(*params));
+	LOG_DBG("");
 
-	if (inst != NULL) {
-		const char *bearer_uci = NULL;
-
-		if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) && inst->gtbs) {
-			BT_DBG("GTBS");
+	ret = handle_string_long_read(inst, err, data, params->single.offset, length, true);
+	if (ret != BT_GATT_ITER_CONTINUE) {
+		if (ret == BT_GATT_ITER_STOP) {
+			/* At this point the inst->net_buf.data contains a NULL terminator string */
+			bearer_uci_changed(conn, 0, inst_index, (char *)inst->net_buf.data);
 		} else {
-			BT_DBG("Index %u", inst->index);
+			bearer_uci_changed(conn, ret, inst_index, NULL);
 		}
 
-		if (err != 0) {
-			BT_DBG("err: 0x%02X", err);
-		} else if (data != NULL) {
-			bearer_uci = parse_string_value(data, length,
-							BT_TBS_MAX_UCI_SIZE);
-			BT_DBG("%s", bearer_uci);
-		}
+		tbs_client_gatt_read_complete(inst);
 
-		inst->busy = false;
-
-		if (tbs_client_cbs != NULL && tbs_client_cbs->bearer_uci != NULL) {
-			tbs_client_cbs->bearer_uci(conn, err, inst->index, bearer_uci);
-		}
+		return BT_GATT_ITER_STOP;
 	}
 
-	return BT_GATT_ITER_STOP;
+	return BT_GATT_ITER_CONTINUE;
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_UCI) */
 
@@ -684,82 +1008,74 @@ static uint8_t read_technology_cb(struct bt_conn *conn, uint8_t err,
 				   struct bt_gatt_read_params *params,
 				   const void *data, uint16_t length)
 {
-	struct bt_tbs_instance *inst = CONTAINER_OF(params, struct bt_tbs_instance, read_params);
+	struct bt_tbs_instance *inst = CONTAINER_OF(params,
+						    struct bt_tbs_instance,
+						    read_params);
+	uint8_t inst_index = tbs_index(conn, inst);
+	uint8_t cb_err = err;
+	uint8_t technology = 0;
 
-	(void)memset(params, 0, sizeof(*params));
+	LOG_DBG("Index %u", inst_index);
 
-	if (inst != NULL) {
-		uint8_t cb_err = err;
-		uint8_t technology = 0;
-
-		if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) && inst->gtbs) {
-			BT_DBG("GTBS");
+	if (err != 0) {
+		LOG_DBG("err: 0x%02X", err);
+	} else if (data != NULL) {
+		LOG_HEXDUMP_DBG(data, length, "Data read");
+		if (length == sizeof(technology)) {
+			(void)memcpy(&technology, data, length);
+			LOG_DBG("%s (0x%02x)", bt_tbs_technology_str(technology), technology);
 		} else {
-			BT_DBG("Index %u", inst->index);
-		}
-
-		if (err != 0) {
-			BT_DBG("err: 0x%02X", err);
-		} else if (data != NULL) {
-			BT_HEXDUMP_DBG(data, length, "Data read");
-			if (length == sizeof(technology)) {
-				(void)memcpy(&technology, data, length);
-				BT_DBG("%s (0x%02x)",
-				       bt_tbs_technology_str(technology),
-				       technology);
-			} else {
-				BT_DBG("Invalid length");
-				cb_err = BT_ATT_ERR_INVALID_ATTRIBUTE_LEN;
-			}
-		}
-
-		inst->busy = false;
-
-		if (tbs_client_cbs != NULL && tbs_client_cbs->technology != NULL) {
-			tbs_client_cbs->technology(conn, cb_err, inst->index,
-					    technology);
+			LOG_DBG("Invalid length");
+			cb_err = BT_ATT_ERR_INVALID_ATTRIBUTE_LEN;
 		}
 	}
+
+	tbs_client_gatt_read_complete(inst);
+
+	technology_changed(conn, cb_err, inst_index, technology);
 
 	return BT_GATT_ITER_STOP;
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_TECHNOLOGY) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_BEARER_URI_SCHEMES_SUPPORTED_LIST)
+static void uri_list_changed(struct bt_conn *conn, int err, uint8_t inst_index,
+			     const char *uri_list)
+{
+	struct bt_tbs_client_cb *listener, *next;
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&tbs_client_cbs, listener, next, _node) {
+		if (listener->uri_list != NULL) {
+			listener->uri_list(conn, err, inst_index, uri_list);
+		}
+	}
+}
+
 static uint8_t read_uri_list_cb(struct bt_conn *conn, uint8_t err,
 				    struct bt_gatt_read_params *params,
 				    const void *data, uint16_t length)
 {
 	struct bt_tbs_instance *inst = CONTAINER_OF(params, struct bt_tbs_instance, read_params);
+	const uint8_t inst_index = tbs_index(conn, inst);
+	int ret;
 
-	(void)memset(params, 0, sizeof(*params));
+	LOG_DBG("");
 
-	if (inst != NULL) {
-		const char *uri_scheme_list = NULL;
-
-		if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) && inst->gtbs) {
-			BT_DBG("GTBS");
+	ret = handle_string_long_read(inst, err, data, params->single.offset, length, true);
+	if (ret != BT_GATT_ITER_CONTINUE) {
+		if (ret == BT_GATT_ITER_STOP) {
+			/* At this point the inst->net_buf.data contains a NULL terminator string */
+			uri_list_changed(conn, 0, inst_index, (char *)inst->net_buf.data);
 		} else {
-			BT_DBG("Index %u", inst->index);
+			uri_list_changed(conn, ret, inst_index, NULL);
 		}
 
-		if (err != 0) {
-			BT_DBG("err: 0x%02X", err);
-		} else if (data != NULL) {
-			uri_scheme_list = parse_string_value(data, length,
-						MAX_URI_SCHEME_LIST_SIZE);
-			BT_DBG("%s", uri_scheme_list);
-		}
+		tbs_client_gatt_read_complete(inst);
 
-		inst->busy = false;
-
-		if (tbs_client_cbs != NULL && tbs_client_cbs->uri_list != NULL) {
-			tbs_client_cbs->uri_list(conn, err, inst->index,
-					  uri_scheme_list);
-		}
+		return BT_GATT_ITER_STOP;
 	}
 
-	return BT_GATT_ITER_STOP;
+	return BT_GATT_ITER_CONTINUE;
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_URI_SCHEMES_SUPPORTED_LIST) */
 
@@ -768,84 +1084,78 @@ static uint8_t read_signal_strength_cb(struct bt_conn *conn, uint8_t err,
 					struct bt_gatt_read_params *params,
 					const void *data, uint16_t length)
 {
-	struct bt_tbs_instance *inst = CONTAINER_OF(params, struct bt_tbs_instance, read_params);
+	struct bt_tbs_instance *inst = CONTAINER_OF(params,
+						    struct bt_tbs_instance,
+						    read_params);
+	uint8_t inst_index = tbs_index(conn, inst);
+	uint8_t cb_err = err;
+	uint8_t signal_strength = 0;
 
-	(void)memset(params, 0, sizeof(*params));
+	LOG_DBG("Index %u", inst_index);
 
-	if (inst != NULL) {
-		uint8_t cb_err = err;
-		uint8_t signal_strength = 0;
-
-		if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) && inst->gtbs) {
-			BT_DBG("GTBS");
+	if (err != 0) {
+		LOG_DBG("err: 0x%02X", err);
+	} else if (data != NULL) {
+		LOG_HEXDUMP_DBG(data, length, "Data read");
+		if (length == sizeof(signal_strength)) {
+			(void)memcpy(&signal_strength, data, length);
+			LOG_DBG("0x%02x", signal_strength);
 		} else {
-			BT_DBG("Index %u", inst->index);
-		}
-
-		if (err != 0) {
-			BT_DBG("err: 0x%02X", err);
-		} else if (data != NULL) {
-			BT_HEXDUMP_DBG(data, length, "Data read");
-			if (length == sizeof(signal_strength)) {
-				(void)memcpy(&signal_strength, data, length);
-				BT_DBG("0x%02x", signal_strength);
-			} else {
-				BT_DBG("Invalid length");
-				cb_err = BT_ATT_ERR_INVALID_ATTRIBUTE_LEN;
-			}
-		}
-
-		inst->busy = false;
-
-		if (tbs_client_cbs != NULL && tbs_client_cbs->signal_strength != NULL) {
-			tbs_client_cbs->signal_strength(conn, cb_err, inst->index,
-						 signal_strength);
+			LOG_DBG("Invalid length");
+			cb_err = BT_ATT_ERR_INVALID_ATTRIBUTE_LEN;
 		}
 	}
+
+	tbs_client_gatt_read_complete(inst);
+
+	signal_strength_changed(conn, cb_err, inst_index, signal_strength);
 
 	return BT_GATT_ITER_STOP;
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_SIGNAL_STRENGTH) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_READ_BEARER_SIGNAL_INTERVAL)
+static void signal_interval_changed(struct bt_conn *conn, int err, uint8_t inst_index,
+				    uint8_t signal_interval)
+{
+	struct bt_tbs_client_cb *listener, *next;
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&tbs_client_cbs, listener, next, _node) {
+		if (listener->signal_interval != NULL) {
+			listener->signal_interval(conn, err, inst_index, signal_interval);
+		}
+	}
+}
+
 static uint8_t read_signal_interval_cb(struct bt_conn *conn, uint8_t err,
 					struct bt_gatt_read_params *params,
 					const void *data, uint16_t length)
 {
-	struct bt_tbs_instance *inst = CONTAINER_OF(params, struct bt_tbs_instance, read_params);
+	struct bt_tbs_instance *inst = CONTAINER_OF(params,
+						    struct bt_tbs_instance,
+						    read_params);
+	uint8_t inst_index = tbs_index(conn, inst);
+	uint8_t cb_err = err;
+	uint8_t signal_interval = 0;
 
-	(void)memset(params, 0, sizeof(*params));
+	LOG_DBG("Index %u", inst_index);
 
-	if (inst != NULL) {
-		uint8_t cb_err = err;
-		uint8_t signal_interval = 0;
-
-		if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) && inst->gtbs) {
-			BT_DBG("GTBS");
+	if (err != 0) {
+		LOG_DBG("err: 0x%02X", err);
+	} else if (data != NULL) {
+		LOG_HEXDUMP_DBG(data, length, "Data read");
+		if (length == sizeof(signal_interval)) {
+			(void)memcpy(&signal_interval, data, length);
+			LOG_DBG("0x%02x", signal_interval);
 		} else {
-			BT_DBG("Index %u", inst->index);
-		}
-
-		if (err != 0) {
-			BT_DBG("err: 0x%02X", err);
-		} else if (data != NULL) {
-			BT_HEXDUMP_DBG(data, length, "Data read");
-			if (length == sizeof(signal_interval)) {
-				(void)memcpy(&signal_interval, data, length);
-				BT_DBG("0x%02x", signal_interval);
-			} else {
-				BT_DBG("Invalid length");
-				cb_err = BT_ATT_ERR_INVALID_ATTRIBUTE_LEN;
-			}
-		}
-
-		inst->busy = false;
-
-		if (tbs_client_cbs && tbs_client_cbs->signal_interval) {
-			tbs_client_cbs->signal_interval(conn, cb_err, inst->index,
-						 signal_interval);
+			LOG_DBG("Invalid length");
+			cb_err = BT_ATT_ERR_INVALID_ATTRIBUTE_LEN;
 		}
 	}
+
+	tbs_client_gatt_read_complete(inst);
+
+	signal_interval_changed(conn, cb_err, inst_index, signal_interval);
 
 	return BT_GATT_ITER_STOP;
 }
@@ -856,134 +1166,97 @@ static uint8_t read_current_calls_cb(struct bt_conn *conn, uint8_t err,
 				      struct bt_gatt_read_params *params,
 				      const void *data, uint16_t length)
 {
-	struct bt_tbs_instance *inst = CONTAINER_OF(params, struct bt_tbs_instance, read_params);
+	struct bt_tbs_instance *inst = CONTAINER_OF(params,
+						    struct bt_tbs_instance,
+						    read_params);
+	uint8_t inst_index = tbs_index(conn, inst);
 	int tbs_err = err;
-	struct bt_tbs_client_call calls[CONFIG_BT_TBS_CLIENT_MAX_CALLS];
-	uint8_t cnt = 0;
 
-	if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) && inst->gtbs) {
-		BT_DBG("GTBS");
-	} else {
-		BT_DBG("Index %u", inst->index);
+	LOG_DBG("Read bearer list current calls, index %u", inst_index);
+
+	if ((tbs_err == 0) && (data != NULL) &&
+	    (net_buf_simple_tailroom(&inst->net_buf) < length)) {
+		tbs_err = BT_ATT_ERR_INSUFFICIENT_RESOURCES;
 	}
 
 	if (tbs_err != 0) {
-		BT_DBG("err: %d", tbs_err);
-		(void)memset(params, 0, sizeof(*params));
-		if (tbs_client_cbs != NULL &&
-		    tbs_client_cbs->current_calls != NULL) {
-			tbs_client_cbs->current_calls(conn, tbs_err,
-						      inst->index, 0, NULL);
-		}
+		LOG_DBG("err: %d", tbs_err);
+
+		tbs_client_gatt_read_complete(inst);
+
+		current_calls_changed(conn, tbs_err, inst_index, 0, NULL);
 
 		return BT_GATT_ITER_STOP;
 	}
 
 	if (data != NULL) {
-		BT_DBG("Current calls read (offset %u): %s",
-		       params->single.offset, bt_hex(data, length));
-
-		if (inst->net_buf.size < inst->net_buf.len + length) {
-			BT_DBG("Could not read all data, aborting");
-			(void)memset(params, 0, sizeof(*params));
-
-			if (tbs_client_cbs != NULL &&
-			    tbs_client_cbs->current_calls != NULL) {
-				tbs_err = BT_ATT_ERR_INSUFFICIENT_RESOURCES;
-				tbs_client_cbs->current_calls(conn, err,
-							      inst->index,
-							      0, NULL);
-			}
-
-			return BT_GATT_ITER_STOP;
-		}
+		LOG_DBG("Current calls read (offset %u): %s",
+			params->single.offset,
+			bt_hex(data, length));
 
 		net_buf_simple_add_mem(&inst->net_buf, data, length);
 
-		/* Returning continue will try to read more using read long procedure */
+		/* Returning continue will try to read more using read
+		 * long procedure
+		 */
 		return BT_GATT_ITER_CONTINUE;
 	}
 
+	tbs_client_gatt_read_complete(inst);
+
 	if (inst->net_buf.len == 0) {
-		(void)memset(params, 0, sizeof(*params));
-		if (tbs_client_cbs != NULL &&
-		    tbs_client_cbs->current_calls != NULL) {
-			tbs_client_cbs->current_calls(conn, 0, inst->index, 0,
-						      NULL);
-		}
+		current_calls_changed(conn, 0, inst_index, 0, NULL);
 
 		return BT_GATT_ITER_STOP;
 	}
 
-	/* Finished reading, start parsing */
-	while (inst->net_buf.len != 0) {
-		struct bt_tbs_client_call *call = &calls[cnt];
-
-		tbs_err = net_buf_pull_call(&inst->net_buf, call);
-		if (tbs_err == BT_ATT_ERR_INSUFFICIENT_RESOURCES) {
-			BT_WARN("Call skipped due to too long URI");
-			continue;
-		} else if (tbs_err != 0) {
-			BT_DBG("Invalid current call read: %d", err);
-			break;
-		}
-
-		cnt++;
-		if (cnt == CONFIG_BT_TBS_CLIENT_MAX_CALLS) {
-			BT_WARN("Could not parse all calls due to memory restrictions");
-			break;
-		}
-	}
-
-	(void)memset(params, 0, sizeof(*params));
-
-	if (tbs_client_cbs != NULL && tbs_client_cbs->current_calls != NULL) {
-		tbs_client_cbs->current_calls(conn, tbs_err, inst->index, cnt,
-					      calls);
-	}
+	bearer_list_current_calls(conn, inst, &inst->net_buf);
 
 	return BT_GATT_ITER_STOP;
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_LIST_CURRENT_CALLS) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_CCID)
+static void ccid_changed(struct bt_conn *conn, int err, uint8_t inst_index, uint8_t ccid)
+{
+	struct bt_tbs_client_cb *listener, *next;
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&tbs_client_cbs, listener, next, _node) {
+		if (listener->ccid != NULL) {
+			listener->ccid(conn, err, inst_index, ccid);
+		}
+	}
+}
+
 static uint8_t read_ccid_cb(struct bt_conn *conn, uint8_t err,
 			    struct bt_gatt_read_params *params,
 			    const void *data, uint16_t length)
 {
-	struct bt_tbs_instance *inst = CONTAINER_OF(params, struct bt_tbs_instance, read_params);
+	struct bt_tbs_instance *inst = CONTAINER_OF(params,
+						    struct bt_tbs_instance,
+						    read_params);
+	uint8_t inst_index = tbs_index(conn, inst);
+	uint8_t cb_err = err;
+	uint8_t ccid = 0;
 
-	(void)memset(params, 0, sizeof(*params));
+	LOG_DBG("Index %u", inst_index);
 
-	if (inst != NULL) {
-		uint8_t cb_err = err;
-		uint8_t ccid = 0;
-
-		if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) && inst->gtbs) {
-			BT_DBG("GTBS");
+	if (err != 0) {
+		LOG_DBG("err: 0x%02X", err);
+	} else if (data != NULL) {
+		LOG_HEXDUMP_DBG(data, length, "Data read");
+		if (length == sizeof(ccid)) {
+			(void)memcpy(&ccid, data, length);
+			LOG_DBG("0x%02x", ccid);
 		} else {
-			BT_DBG("Index %u", inst->index);
-		}
-
-		if (err != 0) {
-			BT_DBG("err: 0x%02X", err);
-		} else if (data != NULL) {
-			BT_HEXDUMP_DBG(data, length, "Data read");
-			if (length == sizeof(ccid)) {
-				(void)memcpy(&ccid, data, length);
-				BT_DBG("0x%02x", ccid);
-			} else {
-				BT_DBG("Invalid length");
-				cb_err = BT_ATT_ERR_INVALID_ATTRIBUTE_LEN;
-			}
-		}
-
-		inst->busy = false;
-
-		if (tbs_client_cbs != NULL && tbs_client_cbs->ccid != NULL) {
-			tbs_client_cbs->ccid(conn, cb_err, inst->index, ccid);
+			LOG_DBG("Invalid length");
+			cb_err = BT_ATT_ERR_INVALID_ATTRIBUTE_LEN;
 		}
 	}
+
+	tbs_client_gatt_read_complete(inst);
+
+	ccid_changed(conn, cb_err, inst_index, ccid);
 
 	return BT_GATT_ITER_STOP;
 }
@@ -994,41 +1267,31 @@ static uint8_t read_status_flags_cb(struct bt_conn *conn, uint8_t err,
 				    struct bt_gatt_read_params *params,
 				    const void *data, uint16_t length)
 {
-	struct bt_tbs_instance *inst = CONTAINER_OF(params, struct bt_tbs_instance, read_params);
+	struct bt_tbs_instance *inst = CONTAINER_OF(params,
+						    struct bt_tbs_instance,
+						    read_params);
+	uint8_t inst_index = tbs_index(conn, inst);
+	uint8_t cb_err = err;
+	uint16_t status_flags = 0;
 
-	(void)memset(params, 0, sizeof(*params));
+	LOG_DBG("Index %u", inst_index);
 
-	if (inst != NULL) {
-		uint8_t cb_err = err;
-		uint16_t status_flags = 0;
-
-		if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) && inst->gtbs) {
-			BT_DBG("GTBS");
+	if (err != 0) {
+		LOG_DBG("err: 0x%02X", err);
+	} else if (data != NULL) {
+		LOG_HEXDUMP_DBG(data, length, "Data read");
+		if (length == sizeof(status_flags)) {
+			(void)memcpy(&status_flags, data, length);
+			LOG_DBG("0x%04x", status_flags);
 		} else {
-			BT_DBG("Index %u", inst->index);
-		}
-
-		if (err != 0) {
-			BT_DBG("err: 0x%02X", err);
-		} else if (data != NULL) {
-			BT_HEXDUMP_DBG(data, length, "Data read");
-			if (length == sizeof(status_flags)) {
-				(void)memcpy(&status_flags, data, length);
-				BT_DBG("0x%04x", status_flags);
-			} else {
-				BT_DBG("Invalid length");
-				cb_err = BT_ATT_ERR_INVALID_ATTRIBUTE_LEN;
-			}
-		}
-
-		inst->busy = false;
-
-		if (tbs_client_cbs != NULL &&
-		    tbs_client_cbs->status_flags != NULL) {
-			tbs_client_cbs->status_flags(conn, cb_err, inst->index,
-						     status_flags);
+			LOG_DBG("Invalid length");
+			cb_err = BT_ATT_ERR_INVALID_ATTRIBUTE_LEN;
 		}
 	}
+
+	tbs_client_gatt_read_complete(inst);
+
+	status_flags_changed(conn, cb_err, inst_index, status_flags);
 
 	return BT_GATT_ITER_STOP;
 }
@@ -1040,36 +1303,26 @@ static uint8_t read_call_uri_cb(struct bt_conn *conn, uint8_t err,
 				const void *data, uint16_t length)
 {
 	struct bt_tbs_instance *inst = CONTAINER_OF(params, struct bt_tbs_instance, read_params);
+	const uint8_t inst_index = tbs_index(conn, inst);
+	int ret;
 
-	(void)memset(params, 0, sizeof(*params));
+	LOG_DBG("");
 
-	if (inst != NULL) {
-		const char *in_target_uri = NULL;
-
-		if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) && inst->gtbs) {
-			BT_DBG("GTBS");
+	ret = handle_string_long_read(inst, err, data, params->single.offset, length, true);
+	if (ret != BT_GATT_ITER_CONTINUE) {
+		if (ret == BT_GATT_ITER_STOP) {
+			/* At this point the inst->net_buf.data contains a NULL terminator string */
+			call_uri_changed(conn, 0, inst_index, (char *)inst->net_buf.data);
 		} else {
-			BT_DBG("Index %u", inst->index);
+			call_uri_changed(conn, ret, inst_index, NULL);
 		}
 
-		if (err != 0) {
-			BT_DBG("err: 0x%02X", err);
-		} else if (data != NULL) {
-			in_target_uri = parse_string_value(
-						data, length,
-						CONFIG_BT_TBS_MAX_URI_LENGTH);
-			BT_DBG("%s", in_target_uri);
-		}
+		tbs_client_gatt_read_complete(inst);
 
-		inst->busy = false;
-
-		if (tbs_client_cbs != NULL && tbs_client_cbs->call_uri != NULL) {
-			tbs_client_cbs->call_uri(conn, err, inst->index,
-						 in_target_uri);
-		}
+		return BT_GATT_ITER_STOP;
 	}
 
-	return BT_GATT_ITER_STOP;
+	return BT_GATT_ITER_CONTINUE;
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_INCOMING_URI) */
 
@@ -1077,47 +1330,34 @@ static uint8_t read_call_state_cb(struct bt_conn *conn, uint8_t err,
 				  struct bt_gatt_read_params *params,
 				  const void *data, uint16_t length)
 {
-	struct bt_tbs_instance *inst = CONTAINER_OF(params, struct bt_tbs_instance, read_params);
+	struct bt_tbs_instance *inst = CONTAINER_OF(params,
+						    struct bt_tbs_instance,
+						    read_params);
+	uint8_t inst_index = tbs_index(conn, inst);
 	uint8_t cnt = 0;
 	struct bt_tbs_client_call_state call_states[CONFIG_BT_TBS_CLIENT_MAX_CALLS];
 	int tbs_err = err;
 
-	if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) && inst->gtbs) {
-		BT_DBG("GTBS");
-	} else {
-		BT_DBG("Index %u", inst->index);
+	LOG_DBG("Index %u", inst_index);
+
+	if ((tbs_err == 0) && (data != NULL) &&
+	    (net_buf_simple_tailroom(&inst->net_buf) < length)) {
+		tbs_err = BT_ATT_ERR_INSUFFICIENT_RESOURCES;
 	}
 
 	if (tbs_err != 0) {
-		BT_DBG("err: %d", tbs_err);
-		(void)memset(params, 0, sizeof(*params));
-		if (tbs_client_cbs != NULL &&
-		    tbs_client_cbs->call_state != NULL) {
-			tbs_client_cbs->call_state(conn, tbs_err, inst->index,
-						   0, NULL);
-		}
+		LOG_DBG("err: %d", tbs_err);
+
+		tbs_client_gatt_read_complete(inst);
+
+		call_state_changed(conn, tbs_err, inst_index, 0, NULL);
 
 		return BT_GATT_ITER_STOP;
 	}
 
 	if (data != NULL) {
-		BT_DBG("Call states read (offset %u): %s",
-		       params->single.offset, bt_hex(data, length));
-
-		if (inst->net_buf.size < inst->net_buf.len + length) {
-			BT_DBG("Could not read all data, aborting");
-			(void)memset(params, 0, sizeof(*params));
-
-			if (tbs_client_cbs != NULL &&
-			    tbs_client_cbs->call_state != NULL) {
-				tbs_err = BT_ATT_ERR_INSUFFICIENT_RESOURCES;
-				tbs_client_cbs->call_state(conn, err,
-							   inst->index, 0,
-							   NULL);
-			}
-
-			return BT_GATT_ITER_STOP;
-		}
+		LOG_DBG("Call states read (offset %u): %s", params->single.offset,
+			bt_hex(data, length));
 
 		net_buf_simple_add_mem(&inst->net_buf, data, length);
 
@@ -1126,84 +1366,80 @@ static uint8_t read_call_state_cb(struct bt_conn *conn, uint8_t err,
 	}
 
 	if (inst->net_buf.len == 0) {
-		(void)memset(params, 0, sizeof(*params));
-		if (tbs_client_cbs != NULL &&
-		    tbs_client_cbs->call_state != NULL) {
-			tbs_client_cbs->call_state(conn, 0, inst->index, 0,
-						   NULL);
-		}
+		tbs_client_gatt_read_complete(inst);
+
+		call_state_changed(conn, 0, inst_index, 0, NULL);
 
 		return BT_GATT_ITER_STOP;
 	}
 
 	/* Finished reading, start parsing */
 	while (inst->net_buf.len != 0) {
-		struct bt_tbs_client_call_state *call_state = &call_states[cnt];
+		struct bt_tbs_client_call_state *call_state;
+
+		if (cnt == CONFIG_BT_TBS_CLIENT_MAX_CALLS) {
+			LOG_WRN("Could not parse all calls due to memory restrictions");
+			break;
+		}
+
+		call_state = &call_states[cnt];
 
 		tbs_err = net_buf_pull_call_state(&inst->net_buf, call_state);
 		if (tbs_err != 0) {
-			BT_DBG("Invalid current call notification: %d", err);
+			LOG_DBG("Invalid current call notification: %d", err);
 			break;
 		}
 
 		cnt++;
-		if (cnt == CONFIG_BT_TBS_CLIENT_MAX_CALLS) {
-			BT_WARN("Could not parse all calls due to memory restrictions");
-			break;
-		}
 	}
 
-	(void)memset(params, 0, sizeof(*params));
+	tbs_client_gatt_read_complete(inst);
 
-	if (tbs_client_cbs != NULL && tbs_client_cbs->call_state != NULL) {
-		tbs_client_cbs->call_state(conn, tbs_err, inst->index, cnt,
-					   call_states);
-	}
+	call_state_changed(conn, tbs_err, inst_index, cnt, call_states);
 
 	return BT_GATT_ITER_STOP;
 }
 
 #if defined(CONFIG_BT_TBS_CLIENT_OPTIONAL_OPCODES)
+static void optional_opcodes_changed(struct bt_conn *conn, int err, uint8_t inst_index,
+				     uint16_t optional_opcodes)
+{
+	struct bt_tbs_client_cb *listener, *next;
+
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&tbs_client_cbs, listener, next, _node) {
+		if (listener->optional_opcodes != NULL) {
+			listener->optional_opcodes(conn, err, inst_index, optional_opcodes);
+		}
+	}
+}
+
 static uint8_t read_optional_opcodes_cb(struct bt_conn *conn, uint8_t err,
 					struct bt_gatt_read_params *params,
 					const void *data, uint16_t length)
 {
 	struct bt_tbs_instance *inst = CONTAINER_OF(params, struct bt_tbs_instance, read_params);
+	uint8_t inst_index = tbs_index(conn, inst);
+	uint8_t cb_err = err;
+	uint16_t optional_opcodes = 0;
 
-	(void)memset(params, 0, sizeof(*params));
+	LOG_DBG("Index %u", inst_index);
 
-	if (inst != NULL) {
-		uint8_t cb_err = err;
-		uint16_t optional_opcodes = 0;
-
-		if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) && inst->gtbs) {
-			BT_DBG("GTBS");
+	if (err != 0) {
+		LOG_DBG("err: 0x%02X", err);
+	} else if (data != NULL) {
+		LOG_HEXDUMP_DBG(data, length, "Data read");
+		if (length == sizeof(optional_opcodes)) {
+			(void)memcpy(&optional_opcodes, data, length);
+			LOG_DBG("0x%04x", optional_opcodes);
 		} else {
-			BT_DBG("Index %u", inst->index);
-		}
-
-		if (err != 0) {
-			BT_DBG("err: 0x%02X", err);
-		} else if (data != NULL) {
-			BT_HEXDUMP_DBG(data, length, "Data read");
-			if (length == sizeof(optional_opcodes)) {
-				(void)memcpy(&optional_opcodes, data, length);
-				BT_DBG("0x%04x", optional_opcodes);
-			} else {
-				BT_DBG("Invalid length");
-				cb_err = BT_ATT_ERR_INVALID_ATTRIBUTE_LEN;
-			}
-		}
-
-		inst->busy = false;
-
-		if (tbs_client_cbs != NULL &&
-		    tbs_client_cbs->optional_opcodes != NULL) {
-			tbs_client_cbs->optional_opcodes(conn, cb_err,
-							 inst->index,
-							 optional_opcodes);
+			LOG_DBG("Invalid length");
+			cb_err = BT_ATT_ERR_INVALID_ATTRIBUTE_LEN;
 		}
 	}
+
+	tbs_client_gatt_read_complete(inst);
+
+	optional_opcodes_changed(conn, cb_err, inst_index, optional_opcodes);
 
 	return BT_GATT_ITER_STOP;
 }
@@ -1215,36 +1451,26 @@ static uint8_t read_remote_uri_cb(struct bt_conn *conn, uint8_t err,
 				  const void *data, uint16_t length)
 {
 	struct bt_tbs_instance *inst = CONTAINER_OF(params, struct bt_tbs_instance, read_params);
+	const uint8_t inst_index = tbs_index(conn, inst);
+	int ret;
 
-	(void)memset(params, 0, sizeof(*params));
+	LOG_DBG("");
 
-	if (inst != NULL) {
-		const char *remote_uri = NULL;
-
-		if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) && inst->gtbs) {
-			BT_DBG("GTBS");
+	ret = handle_string_long_read(inst, err, data, params->single.offset, length, true);
+	if (ret != BT_GATT_ITER_CONTINUE) {
+		if (ret == BT_GATT_ITER_STOP) {
+			/* At this point the inst->net_buf.data contains a NULL terminator string */
+			remote_uri_changed(conn, 0, inst_index, (char *)inst->net_buf.data);
 		} else {
-			BT_DBG("Index %u", inst->index);
+			remote_uri_changed(conn, ret, inst_index, NULL);
 		}
 
-		if (err != 0) {
-			BT_DBG("err: 0x%02X", err);
-		} else if (data != NULL) {
-			remote_uri = parse_string_value(data, length,
-							CONFIG_BT_TBS_MAX_URI_LENGTH);
-			BT_DBG("%s", remote_uri);
-		}
+		tbs_client_gatt_read_complete(inst);
 
-		inst->busy = false;
-
-		if (tbs_client_cbs != NULL &&
-		    tbs_client_cbs->remote_uri != NULL) {
-			tbs_client_cbs->remote_uri(conn, err, inst->index,
-						   remote_uri);
-		}
+		return BT_GATT_ITER_STOP;
 	}
 
-	return BT_GATT_ITER_STOP;
+	return BT_GATT_ITER_CONTINUE;
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_INCOMING_CALL) */
 
@@ -1254,35 +1480,26 @@ static uint8_t read_friendly_name_cb(struct bt_conn *conn, uint8_t err,
 					 const void *data, uint16_t length)
 {
 	struct bt_tbs_instance *inst = CONTAINER_OF(params, struct bt_tbs_instance, read_params);
+	const uint8_t inst_index = tbs_index(conn, inst);
+	int ret;
 
-	(void)memset(params, 0, sizeof(*params));
+	LOG_DBG("");
 
-	if (inst != NULL) {
-		const char *friendly_name = NULL;
-
-		if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) && inst->gtbs) {
-			BT_DBG("GTBS");
+	ret = handle_string_long_read(inst, err, data, params->single.offset, length, true);
+	if (ret != BT_GATT_ITER_CONTINUE) {
+		if (ret == BT_GATT_ITER_STOP) {
+			/* At this point the inst->net_buf.data contains a NULL terminator string */
+			friendly_name_changed(conn, 0, inst_index, (char *)inst->net_buf.data);
 		} else {
-			BT_DBG("Index %u", inst->index);
+			friendly_name_changed(conn, ret, inst_index, NULL);
 		}
 
-		if (err != 0) {
-			BT_DBG("err: 0x%02X", err);
-		} else if (data != NULL) {
-			friendly_name = parse_string_value(data, length,
-							   CONFIG_BT_TBS_MAX_URI_LENGTH);
-			BT_DBG("%s", friendly_name);
-		}
-		inst->busy = false;
+		tbs_client_gatt_read_complete(inst);
 
-		if (tbs_client_cbs != NULL &&
-		    tbs_client_cbs->friendly_name != NULL) {
-			tbs_client_cbs->friendly_name(conn, err, inst->index,
-						      friendly_name);
-		}
+		return BT_GATT_ITER_STOP;
 	}
 
-	return BT_GATT_ITER_STOP;
+	return BT_GATT_ITER_CONTINUE;
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_CALL_FRIENDLY_NAME) */
 
@@ -1292,60 +1509,29 @@ static uint8_t disc_read_ccid_cb(struct bt_conn *conn, uint8_t err,
 				 const void *data, uint16_t length)
 {
 	struct bt_tbs_instance *inst = CONTAINER_OF(params, struct bt_tbs_instance, read_params);
-	struct bt_tbs_server_inst *srv_inst = &srv_insts[bt_conn_index(conn)];
+	uint8_t inst_index = tbs_index(conn, inst);
 	int cb_err = err;
 
-	(void)memset(params, 0, sizeof(*params));
-
-	if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) && inst->gtbs) {
-		BT_DBG("GTBS");
-	} else {
-		BT_DBG("Index %u", inst->index);
-	}
+	LOG_DBG("Index %u", inst_index);
 
 	if (cb_err != 0) {
-		BT_DBG("err: 0x%02X", cb_err);
+		LOG_DBG("err: 0x%02X", cb_err);
 	} else if (data != NULL) {
 		if (length == sizeof(inst->ccid)) {
 			inst->ccid = ((uint8_t *)data)[0];
-			BT_DBG("0x%02x", inst->ccid);
+			LOG_DBG("0x%02x", inst->ccid);
 		} else {
-			BT_DBG("Invalid length");
+			LOG_DBG("Invalid length");
 			cb_err = BT_ATT_ERR_INVALID_ATTRIBUTE_LEN;
 		}
 	}
 
-	inst->busy = false;
+	tbs_client_gatt_read_complete(inst);
 
 	if (cb_err != 0) {
-		tbs_client_cbs->discover(conn, cb_err, 0U, false);
+		tbs_client_discover_complete(conn, cb_err);
 	} else {
-		if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) &&
-		    inst->index == GTBS_INDEX) {
-			BT_DBG("Setup complete GTBS");
-		} else {
-			BT_DBG("Setup complete for %u / %u TBS",
-			       inst->index + 1U, srv_inst->inst_cnt);
-		}
-
-		(void)memset(params, 0, sizeof(*params));
-
-		if (BT_TBS_INSTANCE_MAX_CNT > 1U &&
-		    (((inst->index + 1U) < srv_inst->inst_cnt) ||
-			(IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) &&
-			 srv_inst->gtbs_found &&
-			 inst->index + 1U == GTBS_INDEX))) {
-			discover_next_instance(conn, inst->index + 1U);
-		} else {
-			srv_inst->current_inst = NULL;
-			if (tbs_client_cbs != NULL &&
-			    tbs_client_cbs->discover != NULL) {
-				tbs_client_cbs->discover(conn, 0,
-							 srv_inst->inst_cnt,
-							 srv_inst->gtbs_found);
-			}
-		}
-
+		discover_next_instance(conn);
 	}
 
 	return BT_GATT_ITER_STOP;
@@ -1358,19 +1544,9 @@ static void tbs_client_disc_read_ccid(struct bt_conn *conn)
 	struct bt_tbs_instance *inst = srv_inst->current_inst;
 	int err;
 
-	inst->read_params.func = disc_read_ccid_cb;
-	inst->read_params.handle_count = 1U;
-	inst->read_params.single.handle = inst->ccid_handle;
-	inst->read_params.single.offset = 0U;
-
-	err = bt_gatt_read(conn, &inst->read_params);
+	err = tbs_client_gatt_read(conn, inst, inst->ccid_handle, disc_read_ccid_cb);
 	if (err != 0) {
-		(void)memset(&inst->read_params, 0, sizeof(inst->read_params));
-		srv_inst->current_inst = NULL;
-		if (tbs_client_cbs != NULL &&
-		    tbs_client_cbs->discover != NULL) {
-			tbs_client_cbs->discover(conn, err, 0U, false);
-		}
+		tbs_client_discover_complete(conn, err);
 	}
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_CCID) */
@@ -1392,12 +1568,14 @@ static uint8_t discover_func(struct bt_conn *conn,
 #if defined(CONFIG_BT_TBS_CLIENT_CCID)
 		/* Read the CCID as the last part of discovering a TBS instance */
 		tbs_client_disc_read_ccid(conn);
+#else
+		discover_next_instance(conn);
 #endif /* defined(CONFIG_BT_TBS_CLIENT_CCID) */
 
 		return BT_GATT_ITER_STOP;
 	}
 
-	BT_DBG("[ATTRIBUTE] handle 0x%04X", attr->handle);
+	LOG_DBG("[ATTRIBUTE] handle 0x%04X", attr->handle);
 
 	if (params->type == BT_GATT_DISCOVER_CHARACTERISTIC) {
 		const struct bt_gatt_chrc *chrc;
@@ -1406,37 +1584,37 @@ static uint8_t discover_func(struct bt_conn *conn,
 		chrc = (struct bt_gatt_chrc *)attr->user_data;
 
 		if (bt_uuid_cmp(chrc->uuid, BT_UUID_TBS_CALL_STATE) == 0) {
-			BT_DBG("Call state");
+			LOG_DBG("Call state");
 			sub_params = &current_inst->call_state_sub_params;
 			sub_params->value_handle = chrc->value_handle;
 			sub_params->disc_params = &current_inst->call_state_sub_disc_params;
 #if defined(CONFIG_BT_TBS_CLIENT_BEARER_PROVIDER_NAME)
 		} else if (bt_uuid_cmp(chrc->uuid, BT_UUID_TBS_PROVIDER_NAME) == 0) {
-			BT_DBG("Provider name");
+			LOG_DBG("Provider name");
 			sub_params = &current_inst->name_sub_params;
 			sub_params->value_handle = chrc->value_handle;
 			sub_params->disc_params = &current_inst->name_sub_disc_params;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_PROVIDER_NAME) */
 #if defined(CONFIG_BT_TBS_CLIENT_BEARER_UCI)
 		} else if (bt_uuid_cmp(chrc->uuid, BT_UUID_TBS_UCI) == 0) {
-			BT_DBG("Bearer UCI");
+			LOG_DBG("Bearer UCI");
 			current_inst->bearer_uci_handle = chrc->value_handle;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_UCI) */
 #if defined(CONFIG_BT_TBS_CLIENT_BEARER_TECHNOLOGY)
 		} else if (bt_uuid_cmp(chrc->uuid, BT_UUID_TBS_TECHNOLOGY) == 0) {
-			BT_DBG("Technology");
+			LOG_DBG("Technology");
 			sub_params = &current_inst->technology_sub_params;
 			sub_params->value_handle = chrc->value_handle;
 			sub_params->disc_params = &current_inst->technology_sub_disc_params;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_TECHNOLOGY) */
 #if defined(CONFIG_BT_TBS_CLIENT_BEARER_URI_SCHEMES_SUPPORTED_LIST)
 		} else if (bt_uuid_cmp(chrc->uuid, BT_UUID_TBS_URI_LIST) == 0) {
-			BT_DBG("URI Scheme List");
+			LOG_DBG("URI Scheme List");
 			current_inst->uri_list_handle = chrc->value_handle;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_URI_SCHEMES_SUPPORTED_LIST) */
 #if defined(CONFIG_BT_TBS_CLIENT_BEARER_SIGNAL_STRENGTH)
 		} else if (bt_uuid_cmp(chrc->uuid, BT_UUID_TBS_SIGNAL_STRENGTH) == 0) {
-			BT_DBG("Signal strength");
+			LOG_DBG("Signal strength");
 			sub_params = &current_inst->signal_strength_sub_params;
 			sub_params->value_handle = chrc->value_handle;
 			sub_params->disc_params = &current_inst->signal_strength_sub_disc_params;
@@ -1444,71 +1622,71 @@ static uint8_t discover_func(struct bt_conn *conn,
 #if defined(CONFIG_BT_TBS_CLIENT_READ_BEARER_SIGNAL_INTERVAL) \
 || defined(CONFIG_BT_TBS_CLIENT_SET_BEARER_SIGNAL_INTERVAL)
 		} else if (bt_uuid_cmp(chrc->uuid, BT_UUID_TBS_SIGNAL_INTERVAL) == 0) {
-			BT_DBG("Signal strength reporting interval");
+			LOG_DBG("Signal strength reporting interval");
 			current_inst->signal_interval_handle = chrc->value_handle;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_READ_BEARER_SIGNAL_INTERVAL) */
 /* || defined(CONFIG_BT_TBS_CLIENT_SET_BEARER_SIGNAL_INTERVAL) */
 #if defined(CONFIG_BT_TBS_CLIENT_BEARER_LIST_CURRENT_CALLS)
 		} else if (bt_uuid_cmp(chrc->uuid, BT_UUID_TBS_LIST_CURRENT_CALLS) == 0) {
-			BT_DBG("Current calls");
+			LOG_DBG("Current calls");
 			sub_params = &current_inst->current_calls_sub_params;
 			sub_params->value_handle = chrc->value_handle;
 			sub_params->disc_params = &current_inst->current_calls_sub_disc_params;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_LIST_CURRENT_CALLS) */
 #if defined(CONFIG_BT_TBS_CLIENT_CCID)
 		} else if (bt_uuid_cmp(chrc->uuid, BT_UUID_CCID) == 0) {
-			BT_DBG("CCID");
+			LOG_DBG("CCID");
 			current_inst->ccid_handle = chrc->value_handle;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_CCID) */
 #if defined(CONFIG_BT_TBS_CLIENT_INCOMING_URI)
 		} else if (bt_uuid_cmp(chrc->uuid, BT_UUID_TBS_INCOMING_URI) == 0) {
-			BT_DBG("Incoming target URI");
+			LOG_DBG("Incoming target URI");
 			sub_params = &current_inst->in_target_uri_sub_params;
 			sub_params->value_handle = chrc->value_handle;
 			sub_params->disc_params = &current_inst->in_target_uri_sub_disc_params;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_INCOMING_URI) */
 #if defined(CONFIG_BT_TBS_CLIENT_STATUS_FLAGS)
 		} else if (bt_uuid_cmp(chrc->uuid, BT_UUID_TBS_STATUS_FLAGS) == 0) {
-			BT_DBG("Status flags");
+			LOG_DBG("Status flags");
 			sub_params = &current_inst->status_flags_sub_params;
 			sub_params->value_handle = chrc->value_handle;
 			sub_params->disc_params = &current_inst->status_sub_disc_params;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_STATUS_FLAGS) */
 #if defined(CONFIG_BT_TBS_CLIENT_CP_PROCEDURES)
 		} else if (bt_uuid_cmp(chrc->uuid, BT_UUID_TBS_CALL_CONTROL_POINT) == 0) {
-			BT_DBG("Call control point");
+			LOG_DBG("Call control point");
 			sub_params = &current_inst->call_cp_sub_params;
 			sub_params->value_handle = chrc->value_handle;
 			sub_params->disc_params = &current_inst->call_cp_sub_disc_params;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_CP_PROCEDURES) */
 #if defined(CONFIG_BT_TBS_CLIENT_OPTIONAL_OPCODES)
 		} else if (bt_uuid_cmp(chrc->uuid, BT_UUID_TBS_OPTIONAL_OPCODES) == 0) {
-			BT_DBG("Supported opcodes");
+			LOG_DBG("Supported opcodes");
 			current_inst->optional_opcodes_handle = chrc->value_handle;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_OPTIONAL_OPCODES) */
 		} else if (bt_uuid_cmp(chrc->uuid, BT_UUID_TBS_TERMINATE_REASON) == 0) {
-			BT_DBG("Termination reason");
+			LOG_DBG("Termination reason");
 			current_inst->termination_reason_handle = chrc->value_handle;
 			sub_params = &current_inst->termination_sub_params;
 			sub_params->value_handle = chrc->value_handle;
 			sub_params->disc_params = &current_inst->termination_sub_disc_params;
 #if defined(CONFIG_BT_TBS_CLIENT_CALL_FRIENDLY_NAME)
 		} else if (bt_uuid_cmp(chrc->uuid, BT_UUID_TBS_FRIENDLY_NAME) == 0) {
-			BT_DBG("Incoming friendly name");
+			LOG_DBG("Incoming friendly name");
 			sub_params = &current_inst->friendly_name_sub_params;
 			sub_params->value_handle = chrc->value_handle;
 			sub_params->disc_params = &current_inst->friendly_name_sub_disc_params;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_CALL_FRIENDLY_NAME) */
 #if defined(CONFIG_BT_TBS_CLIENT_INCOMING_CALL)
 		} else if (bt_uuid_cmp(chrc->uuid, BT_UUID_TBS_INCOMING_CALL) == 0) {
-			BT_DBG("Incoming call");
+			LOG_DBG("Incoming call");
 			sub_params = &current_inst->incoming_call_sub_params;
 			sub_params->value_handle = chrc->value_handle;
 			sub_params->disc_params = &current_inst->incoming_call_sub_disc_params;
 #endif /* defined(CONFIG_BT_TBS_CLIENT_INCOMING_CALL) */
 		}
 
-		if (srv_insts[conn_index].subscribe_all && sub_params != NULL) {
+		if (sub_params != NULL) {
 			sub_params->value = 0;
 			if (chrc->properties & BT_GATT_CHRC_NOTIFY) {
 				sub_params->value = BT_GATT_CCC_NOTIFY;
@@ -1519,18 +1697,22 @@ static uint8_t discover_func(struct bt_conn *conn,
 			if (sub_params->value != 0) {
 				int err;
 
-				/* Setting ccc_handle = will use auto discovery feature */
-				sub_params->ccc_handle = 0;
+				sub_params->ccc_handle = BT_GATT_AUTO_DISCOVER_CCC_HANDLE;
 				sub_params->end_handle = current_inst->end_handle;
 				sub_params->notify = notify_handler;
+				atomic_set_bit(sub_params->flags, BT_GATT_SUBSCRIBE_FLAG_VOLATILE);
+
 				err = bt_gatt_subscribe(conn, sub_params);
-				if (err != 0) {
-					BT_DBG("Could not subscribe to "
-					       "characterstic at handle 0x%04X"
+				if (err != 0 && err != -EALREADY) {
+					LOG_DBG("Could not subscribe to "
+					       "characteristic at handle 0x%04X"
 					       "(%d)",
 					       sub_params->value_handle, err);
+					tbs_client_discover_complete(conn, err);
+
+					return BT_GATT_ITER_STOP;
 				} else {
-					BT_DBG("Subscribed to characterstic at "
+					LOG_DBG("Subscribed to characteristic at "
 					       "handle 0x%04X",
 					       sub_params->value_handle);
 				}
@@ -1541,13 +1723,41 @@ static uint8_t discover_func(struct bt_conn *conn,
 	return BT_GATT_ITER_CONTINUE;
 }
 
-static void discover_next_instance(struct bt_conn *conn, uint8_t index)
+static struct bt_tbs_instance *get_next_instance(struct bt_conn *conn,
+						 struct bt_tbs_server_inst *srv_inst)
+{
+	uint8_t inst_index;
+
+	if (srv_inst->current_inst != NULL) {
+		inst_index = tbs_index(conn, srv_inst->current_inst);
+		if (inst_index == BT_TBS_GTBS_INDEX) {
+			inst_index = 0;
+		} else {
+			inst_index++;
+		}
+
+		return tbs_inst_by_index(conn, inst_index);
+	}
+
+	inst_index = gtbs_found(srv_inst) ? BT_TBS_GTBS_INDEX : 0;
+
+	return tbs_inst_by_index(conn, inst_index);
+}
+
+static void discover_next_instance(struct bt_conn *conn)
 {
 	int err;
 	uint8_t conn_index = bt_conn_index(conn);
 	struct bt_tbs_server_inst *srv_inst = &srv_insts[conn_index];
 
-	srv_inst->current_inst = &srv_inst->tbs_insts[index];
+	srv_inst->current_inst = get_next_instance(conn, srv_inst);
+	if (srv_inst->current_inst == NULL) {
+		tbs_client_discover_complete(conn, 0);
+		return;
+	}
+
+	LOG_DBG("inst_index %u", tbs_index(conn, srv_inst->current_inst));
+
 	(void)memset(&srv_inst->discover_params, 0, sizeof(srv_inst->discover_params));
 	srv_inst->discover_params.uuid = NULL;
 	srv_inst->discover_params.start_handle = srv_inst->current_inst->start_handle;
@@ -1557,13 +1767,25 @@ static void discover_next_instance(struct bt_conn *conn, uint8_t index)
 
 	err = bt_gatt_discover(conn, &srv_inst->discover_params);
 	if (err != 0) {
-		BT_DBG("Discover failed (err %d)", err);
-		srv_inst->current_inst = NULL;
-		if (tbs_client_cbs != NULL &&
-		    tbs_client_cbs->discover != NULL) {
-			tbs_client_cbs->discover(conn, err, srv_inst->inst_cnt,
-						 srv_inst->gtbs_found);
-		}
+		tbs_client_discover_complete(conn, err);
+	}
+}
+
+static void primary_discover_complete(struct bt_tbs_server_inst *server, struct bt_conn *conn)
+{
+	if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS)) {
+		LOG_DBG("Discover complete, found %u instances (GTBS%s found)",
+			inst_cnt(server), gtbs_found(server) ? "" : " not");
+	} else {
+		LOG_DBG("Discover complete, found %u instances", inst_cnt(server));
+	}
+
+	server->current_inst = NULL;
+
+	if (gtbs_found(server) || inst_cnt(server) > 0) {
+		discover_next_instance(conn);
+	} else {
+		tbs_client_discover_complete(conn, 0);
 	}
 }
 
@@ -1572,117 +1794,112 @@ static void discover_next_instance(struct bt_conn *conn, uint8_t index)
  * handles of the writeable characteristics and subscribing to all notify and
  * indicate characteristics.
  */
-static uint8_t primary_discover_func(struct bt_conn *conn,
-				     const struct bt_gatt_attr *attr,
-				     struct bt_gatt_discover_params *params)
+#if defined(CONFIG_BT_TBS_CLIENT_TBS)
+static const struct bt_uuid *tbs_uuid = BT_UUID_TBS;
+
+static uint8_t primary_discover_tbs_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				       struct bt_gatt_discover_params *params)
 {
 	const uint8_t conn_index = bt_conn_index(conn);
 	struct bt_tbs_server_inst *srv_inst = &srv_insts[conn_index];
 
-	/*
-	 * TODO: Since we know the ranges of each instance, we could do
-	 * discover of more than just prim_service->start and
-	 * prim_service->end_handle, so that we can detect multiple instances
-	 * faster
-	 */
+	LOG_DBG("conn %p attr %p", (void *)conn, attr);
 
-	if (attr == NULL || srv_inst->inst_cnt == BT_TBS_INSTANCE_MAX_CNT) {
-		if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) &&
-		    bt_uuid_cmp(params->uuid, BT_UUID_GTBS) == 0) {
-			int err;
-			/* Didn't find GTBS; look for TBS */
-			params->uuid = tbs_uuid;
-			params->start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+	if (attr != NULL) {
+		const struct bt_gatt_service_val *prim_service;
 
-			err = bt_gatt_discover(conn, params);
-			if (err != 0) {
-				BT_DBG("Discover failed (err %d)", err);
-				srv_inst->current_inst = NULL;
-				if (tbs_client_cbs != NULL &&
-				    tbs_client_cbs->discover != NULL) {
-					tbs_client_cbs->discover(conn, err, 0,
-								 false);
-				}
-			}
+		LOG_DBG("[ATTRIBUTE] handle 0x%04X", attr->handle);
 
-			return BT_GATT_ITER_STOP;
+		prim_service = (struct bt_gatt_service_val *)attr->user_data;
+
+		srv_inst->current_inst = &srv_inst->tbs_insts[srv_inst->inst_cnt++];
+		srv_inst->current_inst->start_handle = attr->handle + 1;
+		srv_inst->current_inst->end_handle = prim_service->end_handle;
+
+		if (srv_inst->inst_cnt < ARRAY_SIZE(srv_inst->tbs_insts)) {
+			return BT_GATT_ITER_CONTINUE;
 		}
+	}
 
-		if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS)) {
-			srv_inst->gtbs_found = srv_inst->tbs_insts[GTBS_INDEX].gtbs;
-			BT_DBG("Discover complete, found %u instances "
-			       "(GTBS%s found)",
-				srv_inst->inst_cnt,
-				srv_inst->gtbs_found ? "" : " not");
-		} else {
-			BT_DBG("Discover complete, found %u instances",
-			       srv_inst->inst_cnt);
-		}
+	primary_discover_complete(srv_inst, conn);
 
-		if (srv_inst->inst_cnt != 0) {
-			discover_next_instance(conn, 0);
-		} else if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) &&
-			   srv_inst->gtbs_found) {
-			discover_next_instance(conn, GTBS_INDEX);
-		} else {
-			srv_inst->current_inst = NULL;
-			if (tbs_client_cbs != NULL &&
-			    tbs_client_cbs->discover != NULL) {
-				tbs_client_cbs->discover(conn, 0,
-							 srv_inst->inst_cnt,
-							 srv_inst->gtbs_found);
-			}
-		}
+	return BT_GATT_ITER_STOP;
+}
 
+static int primary_discover_tbs(struct bt_conn *conn)
+{
+	struct bt_tbs_server_inst *srv_inst = &srv_insts[bt_conn_index(conn)];
+	struct bt_gatt_discover_params *params = &srv_inst->discover_params;
+
+	LOG_DBG("conn %p", (void *)conn);
+
+	(void)memset(params, 0, sizeof(*params));
+	params->uuid = tbs_uuid;
+	params->func = primary_discover_tbs_cb;
+	params->type = BT_GATT_DISCOVER_PRIMARY;
+	params->start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+	params->end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+
+	return bt_gatt_discover(conn, params);
+}
+#endif /* CONFIG_BT_TBS_CLIENT_TBS */
+
+#if defined(CONFIG_BT_TBS_CLIENT_GTBS)
+static const struct bt_uuid *gtbs_uuid = BT_UUID_GTBS;
+
+static uint8_t primary_discover_gtbs_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+					struct bt_gatt_discover_params *params)
+{
+	const uint8_t conn_index = bt_conn_index(conn);
+	struct bt_tbs_server_inst *srv_inst = &srv_insts[conn_index];
+
+	LOG_DBG("conn %p attr %p", (void *)conn, attr);
+
+	if (attr != NULL) {
+		const struct bt_gatt_service_val *prim_service;
+
+		LOG_DBG("[ATTRIBUTE] handle 0x%04X", attr->handle);
+
+		prim_service = (struct bt_gatt_service_val *)attr->user_data;
+
+		srv_inst->current_inst = &srv_inst->gtbs_inst;
+		srv_inst->current_inst->start_handle = attr->handle + 1;
+		srv_inst->current_inst->end_handle = prim_service->end_handle;
+	}
+
+#if defined(CONFIG_BT_TBS_CLIENT_TBS)
+	int err;
+
+	err = primary_discover_tbs(conn);
+	if (err == 0) {
 		return BT_GATT_ITER_STOP;
 	}
 
-	BT_DBG("[ATTRIBUTE] handle 0x%04X", attr->handle);
+	LOG_DBG("Discover failed (err %d)", err);
+#endif /* CONFIG_BT_TBS_CLIENT_TBS */
 
-	if (params->type == BT_GATT_DISCOVER_PRIMARY) {
-		const struct bt_gatt_service_val *prim_service;
+	primary_discover_complete(srv_inst, conn);
 
-		prim_service = (struct bt_gatt_service_val *)attr->user_data;
-		params->start_handle = attr->handle + 1;
-
-		srv_inst->current_inst = &srv_inst->tbs_insts[srv_inst->inst_cnt];
-		srv_inst->current_inst->index = srv_inst->inst_cnt;
-
-		if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS) &&
-		    bt_uuid_cmp(params->uuid, BT_UUID_GTBS) == 0) {
-			int err;
-
-			/* GTBS is placed as the "last" instance */
-			srv_inst->current_inst = &srv_inst->tbs_insts[GTBS_INDEX];
-			srv_inst->current_inst->index = GTBS_INDEX;
-			srv_inst->current_inst->gtbs = true;
-			srv_inst->current_inst->start_handle = attr->handle + 1;
-			srv_inst->current_inst->end_handle = prim_service->end_handle;
-
-			params->uuid = tbs_uuid;
-			params->start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
-
-			err = bt_gatt_discover(conn, params);
-			if (err != 0) {
-				BT_DBG("Discover failed (err %d)", err);
-				srv_inst->current_inst = NULL;
-				if (tbs_client_cbs != NULL &&
-				    tbs_client_cbs->discover != NULL) {
-					tbs_client_cbs->discover(conn, err, 0,
-								 false);
-				}
-			}
-
-			return BT_GATT_ITER_STOP;
-		}
-
-		srv_inst->current_inst->start_handle = attr->handle + 1;
-		srv_inst->current_inst->end_handle = prim_service->end_handle;
-		srv_inst->inst_cnt++;
-	}
-
-	return BT_GATT_ITER_CONTINUE;
+	return BT_GATT_ITER_STOP;
 }
+
+static int primary_discover_gtbs(struct bt_conn *conn)
+{
+	struct bt_tbs_server_inst *srv_inst = &srv_insts[bt_conn_index(conn)];
+	struct bt_gatt_discover_params *params = &srv_inst->discover_params;
+
+	LOG_DBG("conn %p", (void *)conn);
+
+	(void)memset(params, 0, sizeof(*params));
+	params->uuid = gtbs_uuid;
+	params->func = primary_discover_gtbs_cb;
+	params->type = BT_GATT_DISCOVER_PRIMARY;
+	params->start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+	params->end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+
+	return bt_gatt_discover(conn, params);
+}
+#endif /* defined(CONFIG_BT_TBS_CLIENT_GTBS) */
 
 /****************************** PUBLIC API ******************************/
 
@@ -1734,26 +1951,26 @@ int bt_tbs_client_originate_call(struct bt_conn *conn, uint8_t inst_index,
 
 	if (conn == NULL) {
 		return -ENOTCONN;
-	} else if (!valid_inst_index(conn, inst_index)) {
-		return -EINVAL;
-	} else if (!bt_tbs_valid_uri(uri)) {
-		BT_DBG("Invalid URI: %s", uri);
+	} else if (!bt_tbs_valid_uri(uri, strlen(uri))) {
+		LOG_DBG("Invalid URI: %s", uri);
 		return -EINVAL;
 	}
 
-	inst = get_inst_by_index(conn, inst_index);
+	inst = tbs_inst_by_index(conn, inst_index);
+	if (inst == NULL) {
+		return -EINVAL;
+	}
 
 	/* Check if there are free spots */
 	if (!free_call_spot(inst)) {
-		BT_DBG("Cannot originate more calls");
+		LOG_DBG("Cannot originate more calls");
 		return -ENOMEM;
 	}
 
 	uri_len = strlen(uri);
 
 	if (uri_len > max_uri_len) {
-		BT_DBG("URI len (%zu) longer than maximum writable %zu",
-		       uri_len, max_uri_len);
+		LOG_DBG("URI len (%zu) longer than maximum writable %zu", uri_len, max_uri_len);
 		return -ENOMEM;
 	}
 
@@ -1784,17 +2001,19 @@ int bt_tbs_client_join_calls(struct bt_conn *conn, uint8_t inst_index,
 		uint8_t write_buf[CONFIG_BT_L2CAP_TX_MTU];
 		const size_t max_call_cnt = sizeof(write_buf) - sizeof(join->opcode);
 
-		inst = get_inst_by_index(conn, inst_index);
+		inst = tbs_inst_by_index(conn, inst_index);
 		if (inst == NULL) {
 			return -EINVAL;
-		} else if (inst->call_cp_sub_params.value_handle == 0) {
-			BT_DBG("Handle not set");
+		}
+
+		if (inst->call_cp_sub_params.value_handle == 0) {
+			LOG_DBG("Handle not set");
 			return -EINVAL;
 		}
 
 		if (count > max_call_cnt) {
-			BT_DBG("Call count (%u) larger than maximum writable %zu",
-			       count, max_call_cnt);
+			LOG_DBG("Call count (%u) larger than maximum writable %zu", count,
+				max_call_cnt);
 			return -ENOMEM;
 		}
 
@@ -1823,14 +2042,16 @@ int bt_tbs_client_set_signal_strength_interval(struct bt_conn *conn,
 
 	if (conn == NULL) {
 		return -ENOTCONN;
-	} else if (!valid_inst_index(conn, inst_index)) {
+	}
+
+	inst = tbs_inst_by_index(conn, inst_index);
+	if (inst == NULL) {
 		return -EINVAL;
 	}
 
-	inst = get_inst_by_index(conn, inst_index);
 	/* Populate Outgoing Remote URI */
 	if (inst->signal_interval_handle == 0) {
-		BT_DBG("Handle not set");
+		LOG_DBG("Handle not set");
 		return -EINVAL;
 	}
 
@@ -1845,465 +2066,378 @@ int bt_tbs_client_set_signal_strength_interval(struct bt_conn *conn,
 int bt_tbs_client_read_bearer_provider_name(struct bt_conn *conn,
 					    uint8_t inst_index)
 {
-	int err;
 	struct bt_tbs_instance *inst;
 
 	if (conn == NULL) {
 		return -ENOTCONN;
-	} else if (!valid_inst_index(conn, inst_index)) {
-		return -EINVAL;
 	}
 
-	inst = get_inst_by_index(conn, inst_index);
+	inst = tbs_inst_by_index(conn, inst_index);
+	if (inst == NULL) {
+		return -EINVAL;
+	}
 
 	if (inst->name_sub_params.value_handle == 0) {
-		BT_DBG("Handle not set");
+		LOG_DBG("Handle not set");
 		return -EINVAL;
 	}
 
-	inst->read_params.func = read_bearer_provider_name_cb;
-	inst->read_params.handle_count = 1;
-	inst->read_params.single.handle = inst->name_sub_params.value_handle;
-	inst->read_params.single.offset = 0U;
-
-	err = bt_gatt_read(conn, &inst->read_params);
-	if (err != 0) {
-		(void)memset(&inst->read_params, 0, sizeof(inst->read_params));
-	}
-
-	return err;
+	return tbs_client_gatt_read(conn, inst, inst->name_sub_params.value_handle,
+				    read_bearer_provider_name_cb);
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_PROVIDER_NAME) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_BEARER_UCI)
 int bt_tbs_client_read_bearer_uci(struct bt_conn *conn, uint8_t inst_index)
 {
-	int err;
 	struct bt_tbs_instance *inst;
 
 	if (conn == NULL) {
 		return -ENOTCONN;
-	} else if (!valid_inst_index(conn, inst_index)) {
-		return -EINVAL;
 	}
 
-	inst = get_inst_by_index(conn, inst_index);
+	inst = tbs_inst_by_index(conn, inst_index);
+	if (inst == NULL) {
+		return -EINVAL;
+	}
 
 	if (inst->bearer_uci_handle == 0) {
-		BT_DBG("Handle not set");
+		LOG_DBG("Handle not set");
 		return -EINVAL;
 	}
 
-	inst->read_params.func = read_bearer_uci_cb;
-	inst->read_params.handle_count = 1;
-	inst->read_params.single.handle = inst->bearer_uci_handle;
-	inst->read_params.single.offset = 0U;
-
-	err = bt_gatt_read(conn, &inst->read_params);
-	if (err != 0) {
-		(void)memset(&inst->read_params, 0, sizeof(inst->read_params));
-	}
-
-	return err;
+	return tbs_client_gatt_read(conn, inst, inst->bearer_uci_handle, read_bearer_uci_cb);
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_UCI) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_BEARER_TECHNOLOGY)
 int bt_tbs_client_read_technology(struct bt_conn *conn, uint8_t inst_index)
 {
-	int err;
 	struct bt_tbs_instance *inst;
 
 	if (conn == NULL) {
 		return -ENOTCONN;
-	} else if (!valid_inst_index(conn, inst_index)) {
-		return -EINVAL;
 	}
 
-	inst = get_inst_by_index(conn, inst_index);
+	inst = tbs_inst_by_index(conn, inst_index);
+	if (inst == NULL) {
+		return -EINVAL;
+	}
 
 	if (inst->technology_sub_params.value_handle == 0) {
-		BT_DBG("Handle not set");
+		LOG_DBG("Handle not set");
 		return -EINVAL;
 	}
 
-	inst->read_params.func = read_technology_cb;
-	inst->read_params.handle_count = 1;
-	inst->read_params.single.handle = inst->technology_sub_params.value_handle;
-	inst->read_params.single.offset = 0U;
-
-	err = bt_gatt_read(conn, &inst->read_params);
-	if (err != 0) {
-		(void)memset(&inst->read_params, 0, sizeof(inst->read_params));
-	}
-
-	return err;
+	return tbs_client_gatt_read(conn, inst, inst->technology_sub_params.value_handle,
+				    read_technology_cb);
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_TECHNOLOGY) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_BEARER_URI_SCHEMES_SUPPORTED_LIST)
 int bt_tbs_client_read_uri_list(struct bt_conn *conn, uint8_t inst_index)
 {
-	int err;
 	struct bt_tbs_instance *inst;
 
 	if (conn == NULL) {
 		return -ENOTCONN;
-	} else if (!valid_inst_index(conn, inst_index)) {
-		return -EINVAL;
 	}
 
-	inst = get_inst_by_index(conn, inst_index);
+	inst = tbs_inst_by_index(conn, inst_index);
+	if (inst == NULL) {
+		return -EINVAL;
+	}
 
 	if (inst->uri_list_handle == 0) {
-		BT_DBG("Handle not set");
+		LOG_DBG("Handle not set");
 		return -EINVAL;
 	}
 
-	inst->read_params.func = read_uri_list_cb;
-	inst->read_params.handle_count = 1;
-	inst->read_params.single.handle = inst->uri_list_handle;
-	inst->read_params.single.offset = 0U;
-
-	err = bt_gatt_read(conn, &inst->read_params);
-	if (err != 0) {
-		(void)memset(&inst->read_params, 0, sizeof(inst->read_params));
-	}
-
-	return err;
+	return tbs_client_gatt_read(conn, inst, inst->uri_list_handle, read_uri_list_cb);
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_URI_SCHEMES_SUPPORTED_LIST) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_BEARER_SIGNAL_STRENGTH)
 int bt_tbs_client_read_signal_strength(struct bt_conn *conn, uint8_t inst_index)
 {
-	int err;
 	struct bt_tbs_instance *inst;
 
 	if (conn == NULL) {
 		return -ENOTCONN;
-	} else if (!valid_inst_index(conn, inst_index)) {
-		return -EINVAL;
 	}
 
-	inst = get_inst_by_index(conn, inst_index);
+	inst = tbs_inst_by_index(conn, inst_index);
+	if (inst == NULL) {
+		return -EINVAL;
+	}
 
 	if (inst->signal_strength_sub_params.value_handle == 0) {
-		BT_DBG("Handle not set");
+		LOG_DBG("Handle not set");
 		return -EINVAL;
 	}
 
-	inst->read_params.func = read_signal_strength_cb;
-	inst->read_params.handle_count = 1;
-	inst->read_params.single.handle = inst->signal_strength_sub_params.value_handle;
-	inst->read_params.single.offset = 0U;
-
-	err = bt_gatt_read(conn, &inst->read_params);
-	if (err != 0) {
-		(void)memset(&inst->read_params, 0, sizeof(inst->read_params));
-	}
-
-	return err;
+	return tbs_client_gatt_read(conn, inst, inst->signal_strength_sub_params.value_handle,
+				    read_signal_strength_cb);
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_SIGNAL_STRENGTH) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_READ_BEARER_SIGNAL_INTERVAL)
 int bt_tbs_client_read_signal_interval(struct bt_conn *conn, uint8_t inst_index)
 {
-	int err;
 	struct bt_tbs_instance *inst;
 
 	if (conn == NULL) {
 		return -ENOTCONN;
-	} else if (!valid_inst_index(conn, inst_index)) {
-		return -EINVAL;
 	}
 
-	inst = get_inst_by_index(conn, inst_index);
+	inst = tbs_inst_by_index(conn, inst_index);
+	if (inst == NULL) {
+		return -EINVAL;
+	}
 
 	if (inst->signal_interval_handle == 0) {
-		BT_DBG("Handle not set");
+		LOG_DBG("Handle not set");
 		return -EINVAL;
 	}
 
-	inst->read_params.func = read_signal_interval_cb;
-	inst->read_params.handle_count = 1;
-	inst->read_params.single.handle = inst->signal_interval_handle;
-	inst->read_params.single.offset = 0U;
-
-	err = bt_gatt_read(conn, &inst->read_params);
-	if (err != 0) {
-		(void)memset(&inst->read_params, 0, sizeof(inst->read_params));
-	}
-
-	return err;
+	return tbs_client_gatt_read(conn, inst, inst->signal_interval_handle,
+				    read_signal_interval_cb);
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_READ_BEARER_SIGNAL_INTERVAL) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_BEARER_LIST_CURRENT_CALLS)
 int bt_tbs_client_read_current_calls(struct bt_conn *conn, uint8_t inst_index)
 {
-	int err;
 	struct bt_tbs_instance *inst;
 
 	if (conn == NULL) {
 		return -ENOTCONN;
-	} else if (!valid_inst_index(conn, inst_index)) {
-		return -EINVAL;
 	}
 
-	inst = get_inst_by_index(conn, inst_index);
+	inst = tbs_inst_by_index(conn, inst_index);
+	if (inst == NULL) {
+		return -EINVAL;
+	}
 
 	if (inst->current_calls_sub_params.value_handle == 0) {
-		BT_DBG("Handle not set");
+		LOG_DBG("Handle not set");
 		return -EINVAL;
 	}
 
-	inst->read_params.func = read_current_calls_cb;
-	inst->read_params.handle_count = 1;
-	inst->read_params.single.handle = inst->current_calls_sub_params.value_handle;
-	inst->read_params.single.offset = 0U;
-
-	err = bt_gatt_read(conn, &inst->read_params);
-	if (err != 0) {
-		(void)memset(&inst->read_params, 0, sizeof(inst->read_params));
-	}
-
-	return err;
+	return tbs_client_gatt_read(conn, inst, inst->current_calls_sub_params.value_handle,
+				    read_current_calls_cb);
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_BEARER_LIST_CURRENT_CALLS) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_CCID)
 int bt_tbs_client_read_ccid(struct bt_conn *conn, uint8_t inst_index)
 {
-	int err;
 	struct bt_tbs_instance *inst;
 
 	if (conn == NULL) {
 		return -ENOTCONN;
-	} else if (!valid_inst_index(conn, inst_index)) {
-		return -EINVAL;
 	}
 
-	inst = get_inst_by_index(conn, inst_index);
+	inst = tbs_inst_by_index(conn, inst_index);
+	if (inst == NULL) {
+		return -EINVAL;
+	}
 
 	if (inst->ccid_handle == 0) {
-		BT_DBG("Handle not set");
+		LOG_DBG("Handle not set");
 		return -EINVAL;
 	}
 
-	inst->read_params.func = read_ccid_cb;
-	inst->read_params.handle_count = 1;
-	inst->read_params.single.handle = inst->ccid_handle;
-	inst->read_params.single.offset = 0U;
-
-	err = bt_gatt_read(conn, &inst->read_params);
-	if (err != 0) {
-		(void)memset(&inst->read_params, 0, sizeof(inst->read_params));
-	}
-
-	return err;
+	return tbs_client_gatt_read(conn, inst, inst->ccid_handle, read_ccid_cb);
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_CCID) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_INCOMING_URI)
 int bt_tbs_client_read_call_uri(struct bt_conn *conn, uint8_t inst_index)
 {
-	int err;
 	struct bt_tbs_instance *inst;
 
 	if (conn == NULL) {
 		return -ENOTCONN;
-	} else if (!valid_inst_index(conn, inst_index)) {
-		return -EINVAL;
 	}
 
-	inst = get_inst_by_index(conn, inst_index);
+	inst = tbs_inst_by_index(conn, inst_index);
+	if (inst == NULL) {
+		return -EINVAL;
+	}
 
 	if (inst->in_target_uri_sub_params.value_handle == 0) {
-		BT_DBG("Handle not set");
+		LOG_DBG("Handle not set");
 		return -EINVAL;
 	}
 
-	inst->read_params.func = read_call_uri_cb;
-	inst->read_params.handle_count = 1;
-	inst->read_params.single.handle = inst->in_target_uri_sub_params.value_handle;
-	inst->read_params.single.offset = 0U;
-
-	err = bt_gatt_read(conn, &inst->read_params);
-	if (err != 0) {
-		(void)memset(&inst->read_params, 0, sizeof(inst->read_params));
-	}
-
-	return err;
+	return tbs_client_gatt_read(conn, inst, inst->in_target_uri_sub_params.value_handle,
+				    read_call_uri_cb);
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_INCOMING_URI) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_STATUS_FLAGS)
 int bt_tbs_client_read_status_flags(struct bt_conn *conn, uint8_t inst_index)
 {
-	int err;
 	struct bt_tbs_instance *inst;
 
 	if (conn == NULL) {
 		return -ENOTCONN;
-	} else if (!valid_inst_index(conn, inst_index)) {
-		return -EINVAL;
 	}
 
-	inst = get_inst_by_index(conn, inst_index);
+	inst = tbs_inst_by_index(conn, inst_index);
+	if (inst == NULL) {
+		return -EINVAL;
+	}
 
 	if (inst->status_flags_sub_params.value_handle == 0) {
-		BT_DBG("Handle not set");
+		LOG_DBG("Handle not set");
 		return -EINVAL;
 	}
 
-	inst->read_params.func = read_status_flags_cb;
-	inst->read_params.handle_count = 1;
-	inst->read_params.single.handle = inst->status_flags_sub_params.value_handle;
-	inst->read_params.single.offset = 0U;
-
-	err = bt_gatt_read(conn, &inst->read_params);
-	if (err != 0) {
-		(void)memset(&inst->read_params, 0, sizeof(inst->read_params));
-	}
-
-	return err;
+	return tbs_client_gatt_read(conn, inst, inst->status_flags_sub_params.value_handle,
+				    read_status_flags_cb);
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_STATUS_FLAGS) */
 
 int bt_tbs_client_read_call_state(struct bt_conn *conn, uint8_t inst_index)
 {
-	int err;
 	struct bt_tbs_instance *inst;
 
 	if (conn == NULL) {
 		return -ENOTCONN;
-	} else if (!valid_inst_index(conn, inst_index)) {
-		return -EINVAL;
 	}
 
-	inst = get_inst_by_index(conn, inst_index);
+	inst = tbs_inst_by_index(conn, inst_index);
+	if (inst == NULL) {
+		return -EINVAL;
+	}
 
 	if (inst->call_state_sub_params.value_handle == 0) {
-		BT_DBG("Handle not set");
+		LOG_DBG("Handle not set");
 		return -EINVAL;
 	}
 
-	inst->read_params.func = read_call_state_cb;
-	inst->read_params.handle_count = 1;
-	inst->read_params.single.handle = inst->call_state_sub_params.value_handle;
-	inst->read_params.single.offset = 0U;
-
-	err = bt_gatt_read(conn, &inst->read_params);
-	if (err != 0) {
-		(void)memset(&inst->read_params, 0, sizeof(inst->read_params));
-	}
-
-	return err;
+	return tbs_client_gatt_read(conn, inst, inst->call_state_sub_params.value_handle,
+				    read_call_state_cb);
 }
 
 #if defined(CONFIG_BT_TBS_CLIENT_OPTIONAL_OPCODES)
 int bt_tbs_client_read_optional_opcodes(struct bt_conn *conn,
 					uint8_t inst_index)
 {
-	int err;
 	struct bt_tbs_instance *inst;
 
 	if (conn == NULL) {
 		return -ENOTCONN;
-	} else if (!valid_inst_index(conn, inst_index)) {
-		return -EINVAL;
 	}
 
-	inst = get_inst_by_index(conn, inst_index);
+	inst = tbs_inst_by_index(conn, inst_index);
+	if (inst == NULL) {
+		return -EINVAL;
+	}
 
 	if (inst->optional_opcodes_handle == 0) {
-		BT_DBG("Handle not set");
+		LOG_DBG("Handle not set");
 		return -EINVAL;
 	}
 
-	inst->read_params.func = read_optional_opcodes_cb;
-	inst->read_params.handle_count = 1;
-	inst->read_params.single.handle = inst->optional_opcodes_handle;
-	inst->read_params.single.offset = 0U;
-
-	err = bt_gatt_read(conn, &inst->read_params);
-	if (err != 0) {
-		(void)memset(&inst->read_params, 0, sizeof(inst->read_params));
-	}
-
-	return err;
+	return tbs_client_gatt_read(conn, inst, inst->optional_opcodes_handle,
+				    read_optional_opcodes_cb);
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_OPTIONAL_OPCODES) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_INCOMING_CALL)
 int bt_tbs_client_read_remote_uri(struct bt_conn *conn, uint8_t inst_index)
 {
-	int err;
 	struct bt_tbs_instance *inst;
 
 	if (conn == NULL) {
 		return -ENOTCONN;
-	} else if (!valid_inst_index(conn, inst_index)) {
-		return -EINVAL;
 	}
 
-	inst = get_inst_by_index(conn, inst_index);
+	inst = tbs_inst_by_index(conn, inst_index);
+	if (inst == NULL) {
+		return -EINVAL;
+	}
 
 	if (inst->incoming_call_sub_params.value_handle == 0) {
-		BT_DBG("Handle not set");
+		LOG_DBG("Handle not set");
 		return -EINVAL;
 	}
 
-	inst->read_params.func = read_remote_uri_cb;
-	inst->read_params.handle_count = 1;
-	inst->read_params.single.handle = inst->incoming_call_sub_params.value_handle;
-	inst->read_params.single.offset = 0U;
-
-	err = bt_gatt_read(conn, &inst->read_params);
-	if (err != 0) {
-		(void)memset(&inst->read_params, 0, sizeof(inst->read_params));
-	}
-
-	return err;
+	return tbs_client_gatt_read(conn, inst, inst->incoming_call_sub_params.value_handle,
+				    read_remote_uri_cb);
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_INCOMING_CALL) */
 
 #if defined(CONFIG_BT_TBS_CLIENT_CALL_FRIENDLY_NAME)
 int bt_tbs_client_read_friendly_name(struct bt_conn *conn, uint8_t inst_index)
 {
-	int err;
 	struct bt_tbs_instance *inst;
 
 	if (conn == NULL) {
 		return -ENOTCONN;
-	} else if (!valid_inst_index(conn, inst_index)) {
-		return -EINVAL;
 	}
 
-	inst = get_inst_by_index(conn, inst_index);
+	inst = tbs_inst_by_index(conn, inst_index);
+	if (inst == NULL) {
+		return -EINVAL;
+	}
 
 	if (inst->friendly_name_sub_params.value_handle == 0) {
-		BT_DBG("Handle not set");
+		LOG_DBG("Handle not set");
 		return -EINVAL;
 	}
 
-	inst->read_params.func = read_friendly_name_cb;
-	inst->read_params.handle_count = 1;
-	inst->read_params.single.handle = inst->friendly_name_sub_params.value_handle;
-	inst->read_params.single.offset = 0U;
-
-	err = bt_gatt_read(conn, &inst->read_params);
-	if (err != 0) {
-		(void)memset(&inst->read_params, 0, sizeof(inst->read_params));
-	}
-
-	return err;
+	return tbs_client_gatt_read(conn, inst, inst->friendly_name_sub_params.value_handle,
+				    read_friendly_name_cb);
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_CALL_FRIENDLY_NAME) */
 
-int bt_tbs_client_discover(struct bt_conn *conn, bool subscribe)
+static bool check_and_set_all_busy(struct bt_tbs_server_inst *srv_inst)
+{
+	bool all_idle = true;
+
+#if defined(CONFIG_BT_TBS_CLIENT_GTBS)
+	if (atomic_test_and_set_bit(srv_inst->gtbs_inst.flags, BT_TBS_CLIENT_FLAG_BUSY)) {
+		LOG_DBG("GTBS is busy");
+
+		return false;
+	}
+#endif /* CONFIG_BT_TBS_CLIENT_GTBS */
+
+#if defined(CONFIG_BT_TBS_CLIENT_TBS)
+	size_t num_free;
+
+	for (num_free = 0U; num_free < ARRAY_SIZE(srv_inst->tbs_insts); num_free++) {
+		struct bt_tbs_instance *tbs_inst = &srv_inst->tbs_insts[num_free];
+
+		if (atomic_test_and_set_bit(tbs_inst->flags, BT_TBS_CLIENT_FLAG_BUSY)) {
+			LOG_DBG("inst[%zu] (%p) is busy", num_free, tbs_inst);
+			all_idle = false;
+
+			break;
+		}
+	}
+#endif /* CONFIG_BT_TBS_CLIENT_TBS */
+
+	/* If any is busy, revert any busy states we've set */
+	if (!all_idle) {
+#if defined(CONFIG_BT_TBS_CLIENT_GTBS)
+		atomic_clear_bit(srv_inst->gtbs_inst.flags, BT_TBS_CLIENT_FLAG_BUSY);
+#endif /* CONFIG_BT_TBS_CLIENT_GTBS */
+#if defined(CONFIG_BT_TBS_CLIENT_TBS)
+		for (uint8_t i = 0U; i < num_free; i++) {
+			atomic_clear_bit(srv_inst->tbs_insts[i].flags, BT_TBS_CLIENT_FLAG_BUSY);
+		}
+#endif /* CONFIG_BT_TBS_CLIENT_TBS */
+	}
+
+	return all_idle;
+}
+
+int bt_tbs_client_discover(struct bt_conn *conn)
 {
 	uint8_t conn_index;
 	struct bt_tbs_server_inst *srv_inst;
@@ -2315,54 +2449,62 @@ int bt_tbs_client_discover(struct bt_conn *conn, bool subscribe)
 	conn_index = bt_conn_index(conn);
 	srv_inst = &srv_insts[conn_index];
 
-	if (srv_inst->current_inst) {
+	/* Before we do discovery we ensure that all TBS instances are currently not busy as to not
+	 * interfere with any procedures in progress
+	 */
+	if (!check_and_set_all_busy(srv_inst)) {
 		return -EBUSY;
 	}
 
+#if defined(CONFIG_BT_TBS_CLIENT_TBS)
 	(void)memset(srv_inst->tbs_insts, 0, sizeof(srv_inst->tbs_insts)); /* reset data */
 	srv_inst->inst_cnt = 0;
-	srv_inst->gtbs_found = false;
-	/* Discover TBS on peer, setup handles and notify/indicate */
-	srv_inst->subscribe_all = subscribe;
-	(void)memset(&srv_inst->discover_params, 0, sizeof(srv_inst->discover_params));
-	if (IS_ENABLED(CONFIG_BT_TBS_CLIENT_GTBS)) {
-		BT_DBG("Discovering GTBS");
-		srv_inst->discover_params.uuid = gtbs_uuid;
-	} else {
-		srv_inst->discover_params.uuid = tbs_uuid;
-	}
-	srv_inst->discover_params.func = primary_discover_func;
-	srv_inst->discover_params.type = BT_GATT_DISCOVER_PRIMARY;
-	srv_inst->discover_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
-	srv_inst->discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
-
-	return bt_gatt_discover(conn, &srv_inst->discover_params);
+#endif /* CONFIG_BT_TBS_CLIENT_TBS */
+#if defined(CONFIG_BT_TBS_CLIENT_GTBS)
+	(void)memset(&srv_inst->gtbs_inst, 0, sizeof(srv_inst->gtbs_inst)); /* reset data */
+	return primary_discover_gtbs(conn);
+#else
+	return primary_discover_tbs(conn);
+#endif /* CONFIG_BT_TBS_CLIENT_GTBS */
 }
 
-void bt_tbs_client_register_cb(const struct bt_tbs_client_cb *cbs)
+int bt_tbs_client_register_cb(struct bt_tbs_client_cb *cb)
 {
-	tbs_client_cbs = cbs;
+	CHECKIF(cb == NULL) {
+		LOG_DBG("cb is NULL");
+
+		return -EINVAL;
+	}
+
+	if (sys_slist_find(&tbs_client_cbs, &cb->_node, NULL)) {
+		return -EEXIST;
+	}
+
+	sys_slist_append(&tbs_client_cbs, &cb->_node);
+
+	return 0;
 }
 
 #if defined(CONFIG_BT_TBS_CLIENT_CCID)
+static bool tbs_instance_ccid_is_eq(struct bt_tbs_instance *inst, void *user_data)
+{
+	uint8_t ccid = POINTER_TO_UINT(user_data);
+
+	return inst->ccid == ccid;
+}
+
 struct bt_tbs_instance *bt_tbs_client_get_by_ccid(const struct bt_conn *conn,
 						  uint8_t ccid)
 {
 	struct bt_tbs_server_inst *server;
 
 	CHECKIF(conn == NULL) {
-		BT_DBG("conn was NULL");
+		LOG_DBG("conn was NULL");
 		return NULL;
 	}
 
 	server = &srv_insts[bt_conn_index(conn)];
 
-	for (size_t i = 0; i < ARRAY_SIZE(server->tbs_insts); i++) {
-		if (server->tbs_insts[i].ccid == ccid) {
-			return &server->tbs_insts[i];
-		}
-	}
-
-	return NULL;
+	return tbs_instance_find(server, tbs_instance_ccid_is_eq, UINT_TO_POINTER(ccid));
 }
 #endif /* defined(CONFIG_BT_TBS_CLIENT_CCID) */

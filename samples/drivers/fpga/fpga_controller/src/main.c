@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <zephyr/zephyr.h>
+#include <zephyr/kernel.h>
 #include <zephyr/shell/shell.h>
 #include <zephyr/device.h>
 #include <zephyr/sys/printk.h>
@@ -13,9 +13,9 @@
 #include "greenled.h"
 #include <eoss3_dev.h>
 
-const struct device *fpga = DEVICE_DT_GET(DT_NODELABEL(fpga0));
+const struct device *const fpga = DEVICE_DT_GET(DT_NODELABEL(fpga0));
 
-void main(void)
+int main(void)
 {
 	IO_MUX->PAD_21_CTRL = (PAD_E_4MA | PAD_P_PULLDOWN | PAD_OEN_NORMAL |
 			       PAD_SMT_DISABLE | PAD_REN_DISABLE | PAD_SR_SLOW |
@@ -46,4 +46,5 @@ void main(void)
 		fpga_reset(fpga);
 	}
 #endif
+	return 0;
 }

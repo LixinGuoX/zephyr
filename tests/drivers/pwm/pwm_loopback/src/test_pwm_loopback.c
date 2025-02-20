@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <zephyr/zephyr.h>
+#include <zephyr/kernel.h>
 #include <zephyr/drivers/pwm.h>
 #include <zephyr/ztest.h>
 
@@ -35,7 +35,7 @@ void get_test_pwms(struct test_pwm *out, struct test_pwm *in)
 	zassert_true(device_is_ready(in->dev), "pwm loopback input device is not ready");
 }
 
-void test_capture(uint32_t period, uint32_t pulse, enum test_pwm_unit unit,
+static void test_capture(uint32_t period, uint32_t pulse, enum test_pwm_unit unit,
 		  pwm_flags_t flags)
 {
 	struct test_pwm in;
@@ -85,6 +85,8 @@ void test_capture(uint32_t period, uint32_t pulse, enum test_pwm_unit unit,
 		ztest_test_fail();
 	}
 
+	pwm_disable_capture(in.dev, in.pwm);
+
 	if (err == -ENOTSUP) {
 		TC_PRINT("capture type not supported\n");
 		ztest_test_skip();
@@ -103,7 +105,7 @@ void test_capture(uint32_t period, uint32_t pulse, enum test_pwm_unit unit,
 	}
 }
 
-void test_pulse_capture(void)
+ZTEST_USER(pwm_loopback, test_pulse_capture)
 {
 	test_capture(TEST_PWM_PERIOD_NSEC, TEST_PWM_PULSE_NSEC,
 		     TEST_PWM_UNIT_NSEC,
@@ -113,7 +115,7 @@ void test_pulse_capture(void)
 		     PWM_CAPTURE_TYPE_PULSE | PWM_POLARITY_NORMAL);
 }
 
-void test_pulse_capture_inverted(void)
+ZTEST_USER(pwm_loopback, test_pulse_capture_inverted)
 {
 	test_capture(TEST_PWM_PERIOD_NSEC, TEST_PWM_PULSE_NSEC,
 		     TEST_PWM_UNIT_NSEC,
@@ -123,7 +125,7 @@ void test_pulse_capture_inverted(void)
 		     PWM_CAPTURE_TYPE_PULSE | PWM_POLARITY_INVERTED);
 }
 
-void test_period_capture(void)
+ZTEST_USER(pwm_loopback, test_period_capture)
 {
 	test_capture(TEST_PWM_PERIOD_NSEC, TEST_PWM_PULSE_NSEC,
 		     TEST_PWM_UNIT_NSEC,
@@ -133,7 +135,7 @@ void test_period_capture(void)
 		     PWM_CAPTURE_TYPE_PERIOD | PWM_POLARITY_NORMAL);
 }
 
-void test_period_capture_inverted(void)
+ZTEST_USER(pwm_loopback, test_period_capture_inverted)
 {
 	test_capture(TEST_PWM_PERIOD_NSEC, TEST_PWM_PULSE_NSEC,
 		     TEST_PWM_UNIT_NSEC,
@@ -143,7 +145,7 @@ void test_period_capture_inverted(void)
 		     PWM_CAPTURE_TYPE_PERIOD | PWM_POLARITY_INVERTED);
 }
 
-void test_pulse_and_period_capture(void)
+ZTEST_USER(pwm_loopback, test_pulse_and_period_capture)
 {
 	test_capture(TEST_PWM_PERIOD_NSEC, TEST_PWM_PULSE_NSEC,
 		     TEST_PWM_UNIT_NSEC,
@@ -153,7 +155,7 @@ void test_pulse_and_period_capture(void)
 		     PWM_CAPTURE_TYPE_BOTH | PWM_POLARITY_NORMAL);
 }
 
-void test_capture_timeout(void)
+ZTEST_USER(pwm_loopback, test_capture_timeout)
 {
 	struct test_pwm in;
 	struct test_pwm out;
@@ -212,7 +214,7 @@ static void continuous_capture_callback(const struct device *dev,
 	}
 }
 
-void test_continuous_capture(void)
+ZTEST(pwm_loopback, test_continuous_capture)
 {
 	struct test_pwm in;
 	struct test_pwm out;
@@ -278,7 +280,7 @@ void test_continuous_capture(void)
 	}
 }
 
-void test_capture_busy(void)
+ZTEST(pwm_loopback, test_capture_busy)
 {
 	struct test_pwm in;
 	struct test_pwm out;

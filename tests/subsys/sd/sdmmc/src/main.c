@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <zephyr/zephyr.h>
+#include <zephyr/kernel.h>
 #include <zephyr/sd/sdmmc.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/disk.h>
@@ -14,7 +14,7 @@
 #define SECTOR_COUNT 32
 #define SECTOR_SIZE 512 /* subsystem should set all cards to 512 byte blocks */
 #define BUF_SIZE SECTOR_SIZE * SECTOR_COUNT
-static const struct device *sdhc_dev = DEVICE_DT_GET(DT_ALIAS(sdhc0));
+static const struct device *const sdhc_dev = DEVICE_DT_GET(DT_ALIAS(sdhc0));
 static struct sd_card card;
 static uint8_t buf[BUF_SIZE] __aligned(CONFIG_SDHC_BUFFER_ALIGNMENT);
 static uint8_t check_buf[BUF_SIZE] __aligned(CONFIG_SDHC_BUFFER_ALIGNMENT);
@@ -200,23 +200,41 @@ ZTEST(sd_stack, test_card_config)
 	zassert_equal(card.status, CARD_INITIALIZED, "Card status is not OK");
 	switch (card.card_speed) {
 	case SD_TIMING_SDR12:
-		TC_PRINT("Card timing: SDR12\n");
+		if (card.flags & SD_1800MV_FLAG) {
+			TC_PRINT("Card timing: SDR12\n");
+		} else {
+			/* Card uses non UHS mode timing */
+			TC_PRINT("Card timing: Legacy\n");
+		}
 		break;
 	case SD_TIMING_SDR25:
-		TC_PRINT("Card timing: SDR25\n");
+		if (card.flags & SD_1800MV_FLAG) {
+			TC_PRINT("Card timing: SDR25\n");
+		} else {
+			/* Card uses non UHS mode timing */
+			TC_PRINT("Card timing: High Speed\n");
+		}
 		break;
 	case SD_TIMING_SDR50:
 		TC_PRINT("Card timing: SDR50\n");
+		zassert_true(card.flags & SD_1800MV_FLAG,
+			     "Card must support UHS mode for this timing");
 		break;
 	case SD_TIMING_SDR104:
 		TC_PRINT("Card timing: SDR104\n");
+		zassert_true(card.flags & SD_1800MV_FLAG,
+			     "Card must support UHS mode for this timing");
 		break;
 	case SD_TIMING_DDR50:
 		TC_PRINT("Card timing: DDR50\n");
+		zassert_true(card.flags & SD_1800MV_FLAG,
+			     "Card must support UHS mode for this timing");
 		break;
 	default:
 		zassert_unreachable("Card timing is not known value");
 	}
+	zassert_not_equal(card.bus_io.clock, 0, "Bus should have nonzero clock");
+	TC_PRINT("Bus Frequency: %d Hz\n", card.bus_io.clock);
 	switch (card.type) {
 	case CARD_SDIO:
 		TC_PRINT("Card type: SDIO\n");

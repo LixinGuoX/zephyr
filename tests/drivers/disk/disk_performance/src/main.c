@@ -5,17 +5,19 @@
  */
 
 
-#include <zephyr/zephyr.h>
+#include <zephyr/kernel.h>
 #include <zephyr/ztest.h>
 #include <zephyr/storage/disk_access.h>
 #include <zephyr/device.h>
 #include <zephyr/timing/timing.h>
-#include <zephyr/random/rand32.h>
+#include <zephyr/random/random.h>
 
-#if IS_ENABLED(CONFIG_DISK_DRIVER_SDMMC)
-#define DISK_NAME CONFIG_SDMMC_VOLUME_NAME
-#elif IS_ENABLED(CONFIG_DISK_DRIVER_RAM)
-#define DISK_NAME CONFIG_DISK_RAM_VOLUME_NAME
+#if defined(CONFIG_DISK_DRIVER_SDMMC)
+#define DISK_NAME "SD"
+#elif defined(CONFIG_DISK_DRIVER_MMC)
+#define DISK_NAME "SD2"
+#elif defined(CONFIG_NVME)
+#define DISK_NAME "nvme0n0"
 #else
 #error "No disk device defined, is your board supported?"
 #endif
@@ -111,7 +113,7 @@ static uint64_t read_helper(uint32_t num_blocks)
 	return (total_ns / SEQ_ITERATIONS);
 }
 
-static void test_sequential_read(void)
+ZTEST(disk_performance, test_sequential_read)
 {
 	uint64_t time_ns;
 
@@ -174,7 +176,7 @@ static uint64_t write_helper(uint32_t num_blocks)
 	return (total_ns / SEQ_ITERATIONS);
 }
 
-static void test_sequential_write(void)
+ZTEST(disk_performance, test_sequential_write)
 {
 	uint64_t time_ns;
 
@@ -196,7 +198,7 @@ static void test_sequential_write(void)
 		((BUF_SIZE) * (NSEC_PER_SEC / time_ns)) / 1024);
 }
 
-static void test_random_read(void)
+ZTEST(disk_performance, test_random_read)
 {
 	timing_t start_time, end_time;
 	uint64_t cycles, total_ns;
@@ -240,8 +242,7 @@ static void test_random_read(void)
 		/ total_ns);
 }
 
-
-static void test_random_write(void)
+ZTEST(disk_performance, test_random_write)
 {
 	timing_t start_time, end_time;
 	uint64_t cycles, total_ns;
@@ -299,17 +300,11 @@ static void test_random_write(void)
 	}
 }
 
-
-
-void test_main(void)
+static void *disk_setup(void)
 {
-	ztest_test_suite(disk_performance_test,
-		ztest_unit_test(test_setup),
-		ztest_unit_test(test_sequential_read),
-		ztest_unit_test(test_sequential_write),
-		ztest_unit_test(test_random_read),
-		ztest_unit_test(test_random_write)
-	);
+	test_setup();
 
-	ztest_run_test_suite(disk_performance_test);
+	return NULL;
 }
+
+ZTEST_SUITE(disk_performance, NULL, disk_setup, NULL, NULL, NULL);

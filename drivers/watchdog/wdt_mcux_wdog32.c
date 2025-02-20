@@ -7,7 +7,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#define DT_DRV_COMPAT nxp_kinetis_wdog32
+#define DT_DRV_COMPAT nxp_wdog32
 
 #include <zephyr/drivers/watchdog.h>
 #include <zephyr/drivers/clock_control.h>
@@ -15,6 +15,7 @@
 
 #define LOG_LEVEL CONFIG_WDT_LOG_LEVEL
 #include <zephyr/logging/log.h>
+#include <zephyr/irq.h>
 LOG_MODULE_REGISTER(wdt_mcux_wdog32);
 
 #define MIN_TIMEOUT 1
@@ -177,7 +178,7 @@ static int mcux_wdog32_init(const struct device *dev)
 	return 0;
 }
 
-static const struct wdt_driver_api mcux_wdog32_api = {
+static DEVICE_API(wdt, mcux_wdog32_api) = {
 	.setup = mcux_wdog32_setup,
 	.disable = mcux_wdog32_disable,
 	.install_timeout = mcux_wdog32_install_timeout,

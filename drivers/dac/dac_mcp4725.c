@@ -5,7 +5,7 @@
  */
 #define DT_DRV_COMPAT microchip_mcp4725
 
-#include <zephyr/zephyr.h>
+#include <zephyr/kernel.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/dac.h>
 #include <zephyr/logging/log.h>
@@ -76,6 +76,10 @@ static int mcp4725_channel_setup(const struct device *dev,
 		return -ENOTSUP;
 	}
 
+	if (channel_cfg->internal) {
+		return -ENOTSUP;
+	}
+
 	return 0;
 }
 
@@ -125,7 +129,7 @@ static int dac_mcp4725_init(const struct device *dev)
 	return 0;
 }
 
-static const struct dac_driver_api mcp4725_driver_api = {
+static DEVICE_API(dac, mcp4725_driver_api) = {
 	.channel_setup = mcp4725_channel_setup,
 	.write_value = mcp4725_write_value,
 };

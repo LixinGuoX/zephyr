@@ -110,16 +110,18 @@ static int th02_channel_get(const struct device *dev,
 		/* val = sample / 32 - 50 */
 		val->val1 = drv_data->t_sample / 32U - 50;
 		val->val2 = (drv_data->t_sample % 32) * (1000000 / 32);
-	} else {
+	} else if (chan == SENSOR_CHAN_HUMIDITY) {
 		/* val = sample / 16 -24 */
 		val->val1 = drv_data->rh_sample / 16U - 24;
 		val->val2 = (drv_data->rh_sample % 16) * (1000000 / 16);
+	} else {
+		return -ENOTSUP;
 	}
 
 	return 0;
 }
 
-static const struct sensor_driver_api th02_driver_api = {
+static DEVICE_API(sensor, th02_driver_api) = {
 	.sample_fetch = th02_sample_fetch,
 	.channel_get = th02_channel_get,
 };
@@ -143,7 +145,7 @@ static int th02_init(const struct device *dev)
 		.i2c = I2C_DT_SPEC_INST_GET(inst),					\
 	};										\
 											\
-	DEVICE_DT_INST_DEFINE(inst, th02_init, NULL,					\
+	SENSOR_DEVICE_DT_INST_DEFINE(inst, th02_init, NULL,				\
 			      &th02_data_##inst, &th02_config_##inst, POST_KERNEL,	\
 			      CONFIG_SENSOR_INIT_PRIORITY, &th02_driver_api);		\
 

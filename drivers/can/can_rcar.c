@@ -14,10 +14,9 @@
 #include <zephyr/drivers/clock_control/renesas_cpg_mssr.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/irq.h>
 
 LOG_MODULE_REGISTER(can_rcar, CONFIG_CAN_LOG_LEVEL);
-
-#include "can_utils.h"
 
 /* Control Register */
 #define RCAR_CAN_CTLR             0x0840
@@ -167,30 +166,23 @@ LOG_MODULE_REGISTER(can_rcar, CONFIG_CAN_LOG_LEVEL);
 typedef void (*init_func_t)(const struct device *dev);
 
 struct can_rcar_cfg {
+	const struct can_driver_config common;
 	uint32_t reg_addr;
 	int reg_size;
 	init_func_t init_func;
 	const struct device *clock_dev;
 	struct rcar_cpg_clk mod_clk;
 	struct rcar_cpg_clk bus_clk;
-	uint32_t bus_speed;
-	uint8_t sjw;
-	uint8_t prop_seg;
-	uint8_t phase_seg1;
-	uint8_t phase_seg2;
-	uint16_t sample_point;
 	const struct pinctrl_dev_config *pcfg;
-	const struct device *phy;
-	uint32_t max_bitrate;
 };
 
 struct can_rcar_tx_cb {
-	struct k_sem sem;
 	can_tx_callback_t cb;
 	void *cb_arg;
 };
 
 struct can_rcar_data {
+	struct can_driver_data common;
 	struct k_mutex inst_mutex;
 	struct k_sem tx_sem;
 	struct can_rcar_tx_cb tx_cb[RCAR_CAN_FIFO_DEPTH];
@@ -200,9 +192,7 @@ struct can_rcar_data {
 	struct k_mutex rx_mutex;
 	can_rx_callback_t rx_callback[CONFIG_CAN_RCAR_MAX_FILTER];
 	void *rx_callback_arg[CONFIG_CAN_RCAR_MAX_FILTER];
-	struct zcan_filter filter[CONFIG_CAN_RCAR_MAX_FILTER];
-	can_state_change_callback_t state_change_cb;
-	void *state_change_cb_data;
+	struct can_filter filter[CONFIG_CAN_RCAR_MAX_FILTER];
 	enum can_state state;
 };
 
@@ -218,7 +208,7 @@ static inline void can_rcar_write16(const struct can_rcar_cfg *config,
 	sys_write16(value, config->reg_addr + offs);
 }
 
-static void can_rcar_tx_done(const struct device *dev)
+static void can_rcar_tx_done(const struct device *dev, uint8_t err)
 {
 	struct can_rcar_data *data = dev->data;
 	struct can_rcar_tx_cb *tx_cb;
@@ -230,11 +220,7 @@ static void can_rcar_tx_done(const struct device *dev)
 	}
 
 	data->tx_unsent--;
-	if (tx_cb->cb != NULL) {
-		tx_cb->cb(dev, 0, tx_cb->cb_arg);
-	} else {
-		k_sem_give(&tx_cb->sem);
-	}
+	tx_cb->cb(dev, err, tx_cb->cb_arg);
 	k_sem_give(&data->tx_sem);
 }
 
@@ -249,8 +235,8 @@ static void can_rcar_state_change(const struct device *dev, uint32_t newstate)
 {
 	const struct can_rcar_cfg *config = dev->config;
 	struct can_rcar_data *data = dev->data;
-	const can_state_change_callback_t cb = data->state_change_cb;
-	void *state_change_cb_data = data->state_change_cb_data;
+	const can_state_change_callback_t cb = data->common.state_change_cb;
+	void *state_change_cb_data = data->common.state_change_cb_user_data;
 	struct can_bus_err_cnt err_cnt;
 
 	if (data->state == newstate) {
@@ -322,14 +308,14 @@ static void can_rcar_error(const struct device *dev)
 		/* Clear interrupt condition */
 		sys_write8((uint8_t)~RCAR_CAN_EIFR_EWIF,
 			   config->reg_addr + RCAR_CAN_EIFR);
-		can_rcar_state_change(dev, CAN_ERROR_WARNING);
+		can_rcar_state_change(dev, CAN_STATE_ERROR_WARNING);
 	}
 	if (eifr & RCAR_CAN_EIFR_EPIF) {
 		LOG_DBG("Error passive interrupt\n");
 		/* Clear interrupt condition */
 		sys_write8((uint8_t)~RCAR_CAN_EIFR_EPIF,
 			   config->reg_addr + RCAR_CAN_EIFR);
-		can_rcar_state_change(dev, CAN_ERROR_PASSIVE);
+		can_rcar_state_change(dev, CAN_STATE_ERROR_PASSIVE);
 	}
 	if (eifr & RCAR_CAN_EIFR_BORIF) {
 		LOG_DBG("Bus-off recovery interrupt\n");
@@ -337,7 +323,7 @@ static void can_rcar_error(const struct device *dev)
 		/* Clear interrupt condition */
 		sys_write8((uint8_t)~RCAR_CAN_EIFR_BORIF,
 			   config->reg_addr + RCAR_CAN_EIFR);
-		can_rcar_state_change(dev, CAN_BUS_OFF);
+		can_rcar_state_change(dev, CAN_STATE_BUS_OFF);
 	}
 	if (eifr & RCAR_CAN_EIFR_BOEIF) {
 		LOG_DBG("Bus-off entry interrupt\n");
@@ -345,10 +331,11 @@ static void can_rcar_error(const struct device *dev)
 		/* Clear interrupt condition */
 		sys_write8((uint8_t)~RCAR_CAN_EIFR_BOEIF,
 			   config->reg_addr + RCAR_CAN_EIFR);
-		can_rcar_state_change(dev, CAN_BUS_OFF);
+		can_rcar_state_change(dev, CAN_STATE_BUS_OFF);
 	}
 	if (eifr & RCAR_CAN_EIFR_ORIF) {
 		LOG_DBG("Receive overrun error interrupt\n");
+		CAN_STATS_RX_OVERRUN_INC(dev);
 		sys_write8((uint8_t)~RCAR_CAN_EIFR_ORIF,
 			   config->reg_addr + RCAR_CAN_EIFR);
 	}
@@ -366,18 +353,23 @@ static void can_rcar_error(const struct device *dev)
 
 static void can_rcar_rx_filter_isr(const struct device *dev,
 				   struct can_rcar_data *data,
-				   const struct zcan_frame *frame)
+				   const struct can_frame *frame)
 {
-	struct zcan_frame tmp_frame;
+	struct can_frame tmp_frame;
 	uint8_t i;
+
+#ifndef CONFIG_CAN_ACCEPT_RTR
+	if ((frame->flags & CAN_FRAME_RTR) != 0U) {
+		return;
+	}
+#endif /* !CONFIG_CAN_ACCEPT_RTR */
 
 	for (i = 0; i < CONFIG_CAN_RCAR_MAX_FILTER; i++) {
 		if (data->rx_callback[i] == NULL) {
 			continue;
 		}
 
-		if (!can_utils_filter_match(frame,
-					    &data->filter[i])) {
+		if (!can_frame_matches_filter(frame, &data->filter[i])) {
 			continue; /* filter did not match */
 		}
 		/* Make a temporary copy in case the user
@@ -392,23 +384,16 @@ static void can_rcar_rx_isr(const struct device *dev)
 {
 	const struct can_rcar_cfg *config = dev->config;
 	struct can_rcar_data *data = dev->data;
-	struct zcan_frame frame;
+	struct can_frame frame = {0};
 	uint32_t val;
 	int i;
 
 	val = sys_read32(config->reg_addr + RCAR_CAN_MB_60);
 	if (val & RCAR_CAN_MB_IDE) {
-		frame.id_type = CAN_EXTENDED_IDENTIFIER;
+		frame.flags |= CAN_FRAME_IDE;
 		frame.id = val & RCAR_CAN_MB_EID_MASK;
 	} else {
-		frame.id_type = CAN_STANDARD_IDENTIFIER;
 		frame.id = (val & RCAR_CAN_MB_SID_MASK) >> RCAR_CAN_MB_SID_SHIFT;
-	}
-
-	if (val & RCAR_CAN_MB_RTR) {
-		frame.rtr = CAN_REMOTEREQUEST;
-	} else {
-		frame.rtr = CAN_DATAFRAME;
 	}
 
 	frame.dlc = sys_read16(config->reg_addr +
@@ -421,9 +406,13 @@ static void can_rcar_rx_isr(const struct device *dev)
 		frame.dlc = CAN_MAX_DLC;
 	}
 
-	for (i = 0; i < frame.dlc; i++) {
-		frame.data[i] = sys_read8(config->reg_addr +
-					  RCAR_CAN_MB_60 + RCAR_CAN_MB_DATA_OFFSET + i);
+	if (val & RCAR_CAN_MB_RTR) {
+		frame.flags |= CAN_FRAME_RTR;
+	} else {
+		for (i = 0; i < frame.dlc; i++) {
+			frame.data[i] = sys_read8(config->reg_addr +
+						  RCAR_CAN_MB_60 + RCAR_CAN_MB_DATA_OFFSET + i);
+		}
 	}
 #if defined(CONFIG_CAN_RX_TIMESTAMP)
 	/* read upper byte */
@@ -461,7 +450,7 @@ static void can_rcar_isr(const struct device *dev)
 			if (data->tx_unsent <= unsent) {
 				break;
 			}
-			can_rcar_tx_done(dev);
+			can_rcar_tx_done(dev, 0);
 		}
 
 		/* Clear the Tx interrupt */
@@ -580,16 +569,107 @@ static int can_rcar_get_capabilities(const struct device *dev, can_mode_t *cap)
 	return 0;
 }
 
+static int can_rcar_start(const struct device *dev)
+{
+	const struct can_rcar_cfg *config = dev->config;
+	struct can_rcar_data *data = dev->data;
+	int ret;
+
+	if (data->common.started) {
+		return -EALREADY;
+	}
+
+	if (config->common.phy != NULL) {
+		ret = can_transceiver_enable(config->common.phy, data->common.mode);
+		if (ret != 0) {
+			LOG_ERR("failed to enable CAN transceiver (err %d)", ret);
+			return ret;
+		}
+	}
+
+	k_mutex_lock(&data->inst_mutex, K_FOREVER);
+
+	CAN_STATS_RESET(dev);
+
+	ret = can_rcar_enter_operation_mode(config);
+	if (ret != 0) {
+		LOG_ERR("failed to enter operation mode (err %d)", ret);
+
+		if (config->common.phy != NULL) {
+			/* Attempt to disable the CAN transceiver in case of error */
+			(void)can_transceiver_disable(config->common.phy);
+		}
+	} else {
+		data->common.started = true;
+	}
+
+	k_mutex_unlock(&data->inst_mutex);
+
+	return ret;
+}
+
+static int can_rcar_stop(const struct device *dev)
+{
+	const struct can_rcar_cfg *config = dev->config;
+	struct can_rcar_data *data = dev->data;
+	int ret;
+
+	if (!data->common.started) {
+		return -EALREADY;
+	}
+
+	k_mutex_lock(&data->inst_mutex, K_FOREVER);
+
+	ret = can_rcar_enter_halt_mode(config);
+	if (ret != 0) {
+		LOG_ERR("failed to enter halt mode (err %d)", ret);
+		k_mutex_unlock(&data->inst_mutex);
+		return ret;
+	}
+
+	data->common.started = false;
+
+	k_mutex_unlock(&data->inst_mutex);
+
+	if (config->common.phy != NULL) {
+		ret = can_transceiver_disable(config->common.phy);
+		if (ret != 0) {
+			LOG_ERR("failed to disable CAN transceiver (err %d)", ret);
+			return ret;
+		}
+	}
+
+	/* Resetting TX FIFO, emptying it */
+	sys_write8((uint8_t)~RCAR_CAN_TFCR_TFE, config->reg_addr + RCAR_CAN_TFCR);
+	sys_write8(RCAR_CAN_TFCR_TFE, config->reg_addr + RCAR_CAN_TFCR);
+
+	/* Empty TX msgq, returning an error for each message */
+	while (data->tx_unsent) {
+		can_rcar_tx_done(dev, -ENETDOWN);
+	}
+
+	return 0;
+}
+
 static int can_rcar_set_mode(const struct device *dev, can_mode_t mode)
 {
+	can_mode_t supported = CAN_MODE_LOOPBACK | CAN_MODE_LISTENONLY;
 	const struct can_rcar_cfg *config = dev->config;
 	struct can_rcar_data *data = dev->data;
 	uint8_t tcr = 0;
 	int ret = 0;
 
-	if ((mode & ~(CAN_MODE_LOOPBACK | CAN_MODE_LISTENONLY)) != 0) {
+	if (IS_ENABLED(CONFIG_CAN_MANUAL_RECOVERY_MODE)) {
+		supported |= CAN_MODE_MANUAL_RECOVERY;
+	}
+
+	if ((mode & ~(supported)) != 0) {
 		LOG_ERR("Unsupported mode: 0x%08x", mode);
 		return -ENOTSUP;
+	}
+
+	if (data->common.started) {
+		return -EBUSY;
 	}
 
 	k_mutex_lock(&data->inst_mutex, K_FOREVER);
@@ -610,34 +690,27 @@ static int can_rcar_set_mode(const struct device *dev, can_mode_t mode)
 		tcr = 0;
 	}
 
-	/* Enable CAN transceiver */
-	if (config->phy != NULL) {
-		ret = can_transceiver_enable(config->phy);
-		if (ret != 0) {
-			LOG_ERR("failed to enable CAN transceiver (err %d)", ret);
-			goto unlock;
-		}
-	}
-
-	/* Writing to TCR registers must be done in halt mode */
-	ret = can_rcar_enter_halt_mode(config);
-	if (ret) {
-		goto unlock;
-	}
-
 	sys_write8(tcr, config->reg_addr + RCAR_CAN_TCR);
-	/* Go back to operation mode */
-	ret = can_rcar_enter_operation_mode(config);
+
+	if (IS_ENABLED(CONFIG_CAN_MANUAL_RECOVERY_MODE)) {
+		uint16_t ctlr = can_rcar_read16(config, RCAR_CAN_CTLR);
+
+		if ((mode & CAN_MODE_MANUAL_RECOVERY) != 0U) {
+			/* Set entry to halt automatically at bus-off */
+			ctlr |= RCAR_CAN_CTLR_BOM_ENT;
+		} else {
+			/* Clear entry to halt automatically at bus-off */
+			ctlr &= ~RCAR_CAN_CTLR_BOM_ENT;
+		}
+
+		can_rcar_write16(config, RCAR_CAN_CTLR, ctlr);
+	}
+
+	data->common.mode = mode;
 
 unlock:
-	if (ret != 0) {
-		if (config->phy != NULL) {
-			/* Attempt to disable the CAN transceiver in case of error */
-			(void)can_transceiver_disable(config->phy);
-		}
-	}
-
 	k_mutex_unlock(&data->inst_mutex);
+
 	return ret;
 }
 
@@ -680,6 +753,10 @@ static int can_rcar_set_timing(const struct device *dev,
 	struct reg_backup regs[3] = { { RCAR_CAN_TCR, 0 }, { RCAR_CAN_TFCR, 0 }
 				      , { RCAR_CAN_RFCR, 0 } };
 
+	if (data->common.started) {
+		return -EBUSY;
+	}
+
 	k_mutex_lock(&data->inst_mutex, K_FOREVER);
 
 	/* Changing bittiming should be done in reset mode.
@@ -711,9 +788,6 @@ static int can_rcar_set_timing(const struct device *dev,
 		sys_write8(regs[i].value, config->reg_addr + regs[i].address);
 	}
 
-	/* Go back to operation mode */
-	ret = can_rcar_enter_operation_mode(config);
-
 unlock:
 	k_mutex_unlock(&data->inst_mutex);
 	return ret;
@@ -725,8 +799,8 @@ static void can_rcar_set_state_change_callback(const struct device *dev,
 {
 	struct can_rcar_data *data = dev->data;
 
-	data->state_change_cb = cb;
-	data->state_change_cb_data = user_data;
+	data->common.state_change_cb = cb;
+	data->common.state_change_cb_user_data = user_data;
 }
 
 static int can_rcar_get_state(const struct device *dev, enum can_state *state,
@@ -736,7 +810,11 @@ static int can_rcar_get_state(const struct device *dev, enum can_state *state,
 	struct can_rcar_data *data = dev->data;
 
 	if (state != NULL) {
-		*state = data->state;
+		if (!data->common.started) {
+			*state = CAN_STATE_STOPPED;
+		} else {
+			*state = data->state;
+		}
 	}
 
 	if (err_cnt != NULL) {
@@ -746,7 +824,7 @@ static int can_rcar_get_state(const struct device *dev, enum can_state *state,
 	return 0;
 }
 
-#ifndef CONFIG_CAN_AUTO_BUS_OFF_RECOVERY
+#ifdef CONFIG_CAN_MANUAL_RECOVERY_MODE
 static int can_rcar_recover(const struct device *dev, k_timeout_t timeout)
 {
 	const struct can_rcar_cfg *config = dev->config;
@@ -754,7 +832,15 @@ static int can_rcar_recover(const struct device *dev, k_timeout_t timeout)
 	int64_t start_time;
 	int ret;
 
-	if (data->state != CAN_BUS_OFF) {
+	if (!data->common.started) {
+		return -ENETDOWN;
+	}
+
+	if ((data->common.mode & CAN_MODE_MANUAL_RECOVERY) == 0U) {
+		return -ENOTSUP;
+	}
+
+	if (data->state != CAN_STATE_BUS_OFF) {
 		return 0;
 	}
 
@@ -763,7 +849,7 @@ static int can_rcar_recover(const struct device *dev, k_timeout_t timeout)
 	}
 
 	start_time = k_uptime_ticks();
-	while (data->state == CAN_BUS_OFF) {
+	while (data->state == CAN_STATE_BUS_OFF) {
 		ret = can_rcar_enter_operation_mode(config);
 		if (ret != 0) {
 			goto done;
@@ -780,9 +866,9 @@ done:
 	k_mutex_unlock(&data->inst_mutex);
 	return ret;
 }
-#endif /* CONFIG_CAN_AUTO_BUS_OFF_RECOVERY */
+#endif /* CONFIG_CAN_MANUAL_RECOVERY_MODE */
 
-static int can_rcar_send(const struct device *dev, const struct zcan_frame *frame,
+static int can_rcar_send(const struct device *dev, const struct can_frame *frame,
 			 k_timeout_t timeout, can_tx_callback_t callback,
 			 void *user_data)
 {
@@ -798,16 +884,23 @@ static int can_rcar_send(const struct device *dev, const struct zcan_frame *fram
 		"Remote Frame: %s"
 		, frame->dlc, dev->name
 		, frame->id
-		, frame->id_type == CAN_STANDARD_IDENTIFIER ?
-		"standard" : "extended"
-		, frame->rtr == CAN_DATAFRAME ? "no" : "yes");
-
-	__ASSERT(frame->dlc == 0U || frame->data != NULL, "Dataptr is null");
+		, (frame->flags & CAN_FRAME_IDE) != 0 ?
+		"extended" : "standard"
+		, (frame->flags & CAN_FRAME_RTR) != 0 ? "yes" : "no");
 
 	if (frame->dlc > CAN_MAX_DLC) {
 		LOG_ERR("DLC of %d exceeds maximum (%d)",
 			frame->dlc, CAN_MAX_DLC);
 		return -EINVAL;
+	}
+
+	if ((frame->flags & ~(CAN_FRAME_IDE | CAN_FRAME_RTR)) != 0) {
+		LOG_ERR("unsupported CAN frame flags 0x%02x", frame->flags);
+		return -ENOTSUP;
+	}
+
+	if (!data->common.started) {
+		return -ENETDOWN;
 	}
 
 	/* Wait for a slot into the tx FIFO */
@@ -820,20 +913,18 @@ static int can_rcar_send(const struct device *dev, const struct zcan_frame *fram
 	tx_cb->cb = callback;
 	tx_cb->cb_arg = user_data;
 
-	k_sem_reset(&tx_cb->sem);
-
 	data->tx_head++;
 	if (data->tx_head >= RCAR_CAN_FIFO_DEPTH) {
 		data->tx_head = 0;
 	}
 
-	if (frame->id_type == CAN_STANDARD_IDENTIFIER) {
-		identifier = frame->id << RCAR_CAN_MB_SID_SHIFT;
-	} else {
+	if ((frame->flags & CAN_FRAME_IDE) != 0) {
 		identifier = frame->id | RCAR_CAN_MB_IDE;
+	} else {
+		identifier = frame->id << RCAR_CAN_MB_SID_SHIFT;
 	}
 
-	if (frame->rtr == CAN_REMOTEREQUEST) {
+	if ((frame->flags & CAN_FRAME_RTR) != 0) {
 		identifier |= RCAR_CAN_MB_RTR;
 	}
 
@@ -842,9 +933,11 @@ static int can_rcar_send(const struct device *dev, const struct zcan_frame *fram
 	sys_write16(frame->dlc, config->reg_addr
 		    + RCAR_CAN_MB_56 + RCAR_CAN_MB_DLC_OFFSET);
 
-	for (i = 0; i < frame->dlc; i++) {
-		sys_write8(frame->data[i], config->reg_addr
-			   + RCAR_CAN_MB_56 + RCAR_CAN_MB_DATA_OFFSET + i);
+	if ((frame->flags & CAN_FRAME_RTR) == 0) {
+		for (i = 0; i < frame->dlc; i++) {
+			sys_write8(frame->data[i], config->reg_addr
+				   + RCAR_CAN_MB_56 + RCAR_CAN_MB_DATA_OFFSET + i);
+		}
 	}
 
 	compiler_barrier();
@@ -855,9 +948,6 @@ static int can_rcar_send(const struct device *dev, const struct zcan_frame *fram
 	sys_write8(0xff, config->reg_addr + RCAR_CAN_TFPCR);
 
 	k_mutex_unlock(&data->inst_mutex);
-	if (callback == NULL) {
-		k_sem_take(&tx_cb->sem, K_FOREVER);
-	}
 
 	return 0;
 }
@@ -865,7 +955,7 @@ static int can_rcar_send(const struct device *dev, const struct zcan_frame *fram
 static inline int can_rcar_add_rx_filter_unlocked(const struct device *dev,
 						  can_rx_callback_t cb,
 						  void *cb_arg,
-						  const struct zcan_filter *filter)
+						  const struct can_filter *filter)
 {
 	struct can_rcar_data *data = dev->data;
 	int i;
@@ -884,10 +974,15 @@ static inline int can_rcar_add_rx_filter_unlocked(const struct device *dev,
 }
 
 static int can_rcar_add_rx_filter(const struct device *dev, can_rx_callback_t cb,
-				  void *cb_arg, const struct zcan_filter *filter)
+				  void *cb_arg, const struct can_filter *filter)
 {
 	struct can_rcar_data *data = dev->data;
 	int filter_id;
+
+	if ((filter->flags & ~(CAN_FILTER_IDE)) != 0) {
+		LOG_ERR("unsupported CAN filter flags 0x%02x", filter->flags);
+		return -ENOTSUP;
+	}
 
 	k_mutex_lock(&data->rx_mutex, K_FOREVER);
 	filter_id = can_rcar_add_rx_filter_unlocked(dev, cb, cb_arg, filter);
@@ -899,7 +994,8 @@ static void can_rcar_remove_rx_filter(const struct device *dev, int filter_id)
 {
 	struct can_rcar_data *data = dev->data;
 
-	if (filter_id >= CONFIG_CAN_RCAR_MAX_FILTER) {
+	if (filter_id < 0 || filter_id >= CONFIG_CAN_RCAR_MAX_FILTER) {
+		LOG_ERR("filter ID %d out of bounds", filter_id);
 		return;
 	}
 
@@ -913,29 +1009,25 @@ static int can_rcar_init(const struct device *dev)
 {
 	const struct can_rcar_cfg *config = dev->config;
 	struct can_rcar_data *data = dev->data;
-	struct can_timing timing;
+	struct can_timing timing = { 0 };
 	int ret;
 	uint16_t ctlr;
-	uint8_t idx;
 
 	k_mutex_init(&data->inst_mutex);
 	k_mutex_init(&data->rx_mutex);
 	k_sem_init(&data->tx_sem, RCAR_CAN_FIFO_DEPTH, RCAR_CAN_FIFO_DEPTH);
-	for (idx = 0; idx < RCAR_CAN_FIFO_DEPTH; idx++) {
-		k_sem_init(&data->tx_cb[idx].sem, 0, 1);
-	}
 
 	data->tx_head = 0;
 	data->tx_tail = 0;
 	data->tx_unsent = 0;
 
 	memset(data->rx_callback, 0, sizeof(data->rx_callback));
-	data->state = CAN_ERROR_ACTIVE;
-	data->state_change_cb = NULL;
-	data->state_change_cb_data = NULL;
+	data->state = CAN_STATE_ERROR_ACTIVE;
+	data->common.state_change_cb = NULL;
+	data->common.state_change_cb_user_data = NULL;
 
-	if (config->phy != NULL) {
-		if (!device_is_ready(config->phy)) {
+	if (config->common.phy != NULL) {
+		if (!device_is_ready(config->common.phy)) {
 			LOG_ERR("CAN transceiver not ready");
 			return -ENODEV;
 		}
@@ -954,19 +1046,19 @@ static int can_rcar_init(const struct device *dev)
 
 	/* reset the registers */
 	ret = clock_control_off(config->clock_dev,
-				(clock_control_subsys_t *)&config->mod_clk);
+				(clock_control_subsys_t)&config->mod_clk);
 	if (ret < 0) {
 		return ret;
 	}
 
 	ret = clock_control_on(config->clock_dev,
-			       (clock_control_subsys_t *)&config->mod_clk);
+			       (clock_control_subsys_t)&config->mod_clk);
 	if (ret < 0) {
 		return ret;
 	}
 
 	ret = clock_control_on(config->clock_dev,
-			       (clock_control_subsys_t *)&config->bus_clk);
+			       (clock_control_subsys_t)&config->bus_clk);
 	if (ret < 0) {
 		return ret;
 	}
@@ -983,28 +1075,18 @@ static int can_rcar_init(const struct device *dev)
 		return ret;
 	}
 
-	timing.sjw = config->sjw;
-	if (config->sample_point) {
-		ret = can_calc_timing(dev, &timing, config->bus_speed,
-				      config->sample_point);
-		if (ret == -EINVAL) {
-			LOG_ERR("Can't find timing for given param");
-			return -EIO;
-		}
-		LOG_DBG("Presc: %d, TS1: %d, TS2: %d",
-			timing.prescaler, timing.phase_seg1, timing.phase_seg2);
-		LOG_DBG("Sample-point err : %d", ret);
-	} else {
-		timing.prop_seg = config->prop_seg;
-		timing.phase_seg1 = config->phase_seg1;
-		timing.phase_seg2 = config->phase_seg2;
-		ret = can_calc_prescaler(dev, &timing, config->bus_speed);
-		if (ret) {
-			LOG_WRN("Bitrate error: %d", ret);
-		}
+	ret = can_calc_timing(dev, &timing, config->common.bitrate,
+			      config->common.sample_point);
+	if (ret == -EINVAL) {
+		LOG_ERR("Can't find timing for given param");
+		return -EIO;
 	}
 
-	ret = can_rcar_set_timing(dev, &timing);
+	LOG_DBG("Presc: %d, TS1: %d, TS2: %d",
+		timing.prescaler, timing.phase_seg1, timing.phase_seg2);
+	LOG_DBG("Sample-point err : %d", ret);
+
+	ret = can_set_timing(dev, &timing);
 	if (ret) {
 		return ret;
 	}
@@ -1016,9 +1098,7 @@ static int can_rcar_init(const struct device *dev)
 
 	ctlr = can_rcar_read16(config, RCAR_CAN_CTLR);
 	ctlr |= RCAR_CAN_CTLR_IDFM_MIXED;       /* Select mixed ID mode */
-#ifndef CONFIG_CAN_AUTO_BUS_OFF_RECOVERY
-	ctlr |= RCAR_CAN_CTLR_BOM_ENT;          /* Entry to halt mode automatically at bus-off */
-#endif
+	ctlr &= ~RCAR_CAN_CTLR_BOM_ENT;         /* Clear entry to halt automatically at bus-off */
 	ctlr |= RCAR_CAN_CTLR_MBM;              /* Select FIFO mailbox mode */
 	ctlr |= RCAR_CAN_CTLR_MLM;              /* Overrun mode */
 	ctlr &= ~RCAR_CAN_CTLR_SLPM;            /* Clear CAN Sleep mode */
@@ -1050,14 +1130,8 @@ static int can_rcar_init(const struct device *dev)
 	/* Enable interrupts for all type of errors */
 	sys_write8(0xFF, config->reg_addr + RCAR_CAN_EIER);
 
-	/* Go to operation mode */
-	ret = can_rcar_enter_operation_mode(config);
-	__ASSERT(!ret, "Fail to set CAN controller to operation mode");
-	if (ret) {
-		return ret;
-	}
-
 	config->init_func(dev);
+
 	return 0;
 }
 
@@ -1069,37 +1143,29 @@ static int can_rcar_get_core_clock(const struct device *dev, uint32_t *rate)
 	return 0;
 }
 
-static int can_rcar_get_max_filters(const struct device *dev, enum can_ide id_type)
+static int can_rcar_get_max_filters(const struct device *dev, bool ide)
 {
-	ARG_UNUSED(id_type);
+	ARG_UNUSED(ide);
 
 	return CONFIG_CAN_RCAR_MAX_FILTER;
 }
 
-static int can_rcar_get_max_bitrate(const struct device *dev, uint32_t *max_bitrate)
-{
-	const struct can_rcar_cfg *config = dev->config;
-
-	*max_bitrate = config->max_bitrate;
-
-	return 0;
-}
-
-static const struct can_driver_api can_rcar_driver_api = {
+static DEVICE_API(can, can_rcar_driver_api) = {
 	.get_capabilities = can_rcar_get_capabilities,
+	.start = can_rcar_start,
+	.stop = can_rcar_stop,
 	.set_mode = can_rcar_set_mode,
 	.set_timing = can_rcar_set_timing,
 	.send = can_rcar_send,
 	.add_rx_filter = can_rcar_add_rx_filter,
 	.remove_rx_filter = can_rcar_remove_rx_filter,
 	.get_state = can_rcar_get_state,
-#ifndef CONFIG_CAN_AUTO_BUS_OFF_RECOVERY
+#ifdef CONFIG_CAN_MANUAL_RECOVERY_MODE
 	.recover = can_rcar_recover,
-#endif
+#endif /* CONFIG_CAN_MANUAL_RECOVERY_MODE */
 	.set_state_change_callback = can_rcar_set_state_change_callback,
 	.get_core_clock = can_rcar_get_core_clock,
 	.get_max_filters = can_rcar_get_max_filters,
-	.get_max_bitrate = can_rcar_get_max_bitrate,
 	.timing_min = {
 		.sjw = 0x1,
 		.prop_seg = 0x00,
@@ -1121,6 +1187,7 @@ static const struct can_driver_api can_rcar_driver_api = {
 	PINCTRL_DT_INST_DEFINE(n);						\
 	static void can_rcar_##n##_init(const struct device *dev);		\
 	static const struct can_rcar_cfg can_rcar_cfg_##n = {			\
+		.common = CAN_DT_DRIVER_CONFIG_INST_GET(n, 0, 1000000),		\
 		.reg_addr = DT_INST_REG_ADDR(n),				\
 		.reg_size = DT_INST_REG_SIZE(n),				\
 		.init_func = can_rcar_##n##_init,				\
@@ -1134,15 +1201,7 @@ static const struct can_driver_api can_rcar_driver_api = {
 		.bus_clk.domain =						\
 			DT_INST_CLOCKS_CELL_BY_IDX(n, 1, domain),		\
 		.bus_clk.rate = 40000000,					\
-		.bus_speed = DT_INST_PROP(n, bus_speed),			\
-		.sjw = DT_INST_PROP(n, sjw),					\
-		.prop_seg = DT_INST_PROP_OR(n, prop_seg, 0),			\
-		.phase_seg1 = DT_INST_PROP_OR(n, phase_seg1, 0),		\
-		.phase_seg2 = DT_INST_PROP_OR(n, phase_seg2, 0),		\
-		.sample_point = DT_INST_PROP_OR(n, sample_point, 0),		\
 		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(n),			\
-		.phy = DEVICE_DT_GET_OR_NULL(DT_INST_PHANDLE(n, phys)),		\
-		.max_bitrate = DT_INST_CAN_TRANSCEIVER_MAX_BITRATE(n, 1000000),	\
 	};									\
 	static struct can_rcar_data can_rcar_data_##n;				\
 										\

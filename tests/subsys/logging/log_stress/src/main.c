@@ -8,7 +8,7 @@
 #include <zephyr/sys/util.h>
 #include <string.h>
 #include <zephyr/ztress.h>
-#include <zephyr/random/rand32.h>
+#include <zephyr/random/random.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/logging/log_ctrl.h>
 #include <zephyr/logging/log_backend.h>
@@ -66,7 +66,7 @@ static void mock_init(struct log_backend const *const backend)
 
 static void panic(struct log_backend const *const backend)
 {
-	zassert_true(false, NULL);
+	zassert_true(false);
 }
 
 static void dropped(const struct log_backend *const backend, uint32_t cnt)
@@ -102,7 +102,7 @@ static void validate(int ctx_cnt)
 	zassert_equal(mock_backend.dropped, mock_backend.missing,
 			"dropped:%u missing:%u",
 			mock_backend.dropped, mock_backend.missing);
-	zassert_equal(in_cnt, out_cnt, NULL);
+	zassert_equal(in_cnt, out_cnt);
 }
 
 static bool context_handler(void *user_data, uint32_t cnt, bool last, int prio)
@@ -116,7 +116,7 @@ static bool context_handler(void *user_data, uint32_t cnt, bool last, int prio)
 
 	uint32_t i = cnt | (prio << CNT_BITS);
 
-	switch (sys_rand32_get() % 4) {
+	switch (sys_rand8_get() % 4) {
 	case 0:
 		LOG_INF("%u", i);
 		break;

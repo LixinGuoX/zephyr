@@ -4,19 +4,19 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <zephyr/zephyr.h>
+#include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/sensor.h>
 #include <stdio.h>
 
-void main(void)
+int main(void)
 {
-	const struct device *dev = DEVICE_DT_GET_ONE(honeywell_mpr);
+	const struct device *const dev = DEVICE_DT_GET_ONE(honeywell_mpr);
 	int rc;
 
 	if (!device_is_ready(dev)) {
 		printf("Device %s is not ready\n", dev->name);
-		return;
+		return 0;
 	}
 
 	while (1) {
@@ -38,4 +38,5 @@ void main(void)
 
 		k_sleep(K_SECONDS(1));
 	}
+	return 0;
 }

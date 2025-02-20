@@ -5,7 +5,7 @@
  */
 
 #include <zephyr/ztest.h>
-#include <zephyr/zephyr.h>
+#include <zephyr/kernel.h>
 #include <errno.h>
 #include <zephyr/sys/errno_private.h>
 
@@ -55,7 +55,7 @@ static void errno_thread(void *_n, void *_my_errno, void *_unused)
 		result[n].pass = TC_PASS;
 	}
 
-	zassert_equal(errno, my_errno, NULL);
+	zassert_equal(errno, my_errno);
 
 	k_fifo_put(&fifo, &result[n]);
 }
@@ -97,7 +97,7 @@ ZTEST(common_errno, test_thread_context)
 		}
 	}
 
-	zassert_equal(errno, test_errno, NULL);
+	zassert_equal(errno, test_errno);
 
 	if (errno != errno_values[N_THREADS]) {
 		rv = TC_FAIL;
@@ -118,9 +118,8 @@ ZTEST(common_errno, test_thread_context)
 
 void thread_entry_user(void *p1, void *p2, void *p3)
 {
-#ifdef CONFIG_ARCH_POSIX
-	/* The errno in native posix will be handled by native
-	 * operation system, so we skip it.
+#ifdef CONFIG_NATIVE_LIBC
+	/* The errno when using the host C library will be handled by it, so we skip it.
 	 */
 	ztest_test_skip();
 #else
@@ -160,3 +159,7 @@ ZTEST_USER(common_errno, test_errno)
 
 	k_thread_join(tid, K_FOREVER);
 }
+
+extern void *common_setup(void);
+
+ZTEST_SUITE(common_errno, NULL, common_setup, NULL, NULL, NULL);

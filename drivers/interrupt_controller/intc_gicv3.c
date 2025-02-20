@@ -1,20 +1,55 @@
 /*
  * Copyright 2020 Broadcom
+ * Copyright 2024 NXP
+ * Copyright 2025 Arm Limited and/or its affiliates <open-source-office@arm.com>
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <zephyr/device.h>
+#include <zephyr/kernel.h>
+#include <zephyr/arch/cpu.h>
 #include <zephyr/sys/__assert.h>
 #include <zephyr/sw_isr_table.h>
 #include <zephyr/dt-bindings/interrupt-controller/arm-gic.h>
 #include <zephyr/drivers/interrupt_controller/gic.h>
+#include <zephyr/sys/barrier.h>
 #include "intc_gic_common_priv.h"
 #include "intc_gicv3_priv.h"
 
 #include <string.h>
 
+#define DT_DRV_COMPAT arm_gic_v3
+
+#define GIC_V3_NODE	DT_COMPAT_GET_ANY_STATUS_OKAY(DT_DRV_COMPAT)
+
+#define GIC_REDISTRIBUTOR_STRIDE	DT_PROP_OR(GIC_V3_NODE, redistributor_stride, 0)
+#define GIC_NUM_REDISTRIBUTOR_REGIONS	DT_PROP_OR(GIC_V3_NODE, redistributor_regions, 1)
+
+#define GIC_REG_REGION(idx, node_id)				\
+	{							\
+		.base = DT_REG_ADDR_BY_IDX(node_id, idx),	\
+		.size = DT_REG_SIZE_BY_IDX(node_id, idx),	\
+	}
+
+/*
+ * Structure to save GIC register region info
+ */
+struct gic_reg_region {
+	mem_addr_t base;
+	mem_addr_t size;
+};
+
+/*
+ * GIC register regions info table
+ */
+static struct gic_reg_region gic_reg_regions[] = {
+	LISTIFY(DT_NUM_REGS(GIC_V3_NODE), GIC_REG_REGION, (,), GIC_V3_NODE)
+};
+
+
 /* Redistributor base addresses for each core */
-mem_addr_t gic_rdists[CONFIG_MP_NUM_CPUS];
+mem_addr_t gic_rdists[CONFIG_MP_MAX_NUM_CPUS];
 
 #if defined(CONFIG_ARMV8_A_NS) || defined(CONFIG_GIC_SINGLE_SECURITY_STATE)
 #define IGROUPR_VAL	0xFFFFFFFFU
@@ -78,7 +113,7 @@ static void arm_gic_lpi_setup(unsigned int intid, bool enable)
 		*cfg &= ~BIT(0);
 	}
 
-	dsb();
+	barrier_dsync_fence_full();
 
 	its_rdist_invall();
 }
@@ -90,7 +125,7 @@ static void arm_gic_lpi_set_priority(unsigned int intid, unsigned int prio)
 	*cfg &= 0xfc;
 	*cfg |= prio & 0xfc;
 
-	dsb();
+	barrier_dsync_fence_full();
 
 	its_rdist_invall();
 }
@@ -164,8 +199,6 @@ void arm_gic_irq_enable(unsigned int intid)
 	uint32_t mask = BIT(intid & (GIC_NUM_INTR_PER_REG - 1));
 	uint32_t idx = intid / GIC_NUM_INTR_PER_REG;
 
-	sys_write32(mask, ISENABLER(GET_DIST_BASE(intid), idx));
-
 #if defined(CONFIG_ARMV8_A_NS) || defined(CONFIG_GIC_SINGLE_SECURITY_STATE)
 	/*
 	 * Affinity routing is enabled for Armv8-A Non-secure state (GICD_CTLR.ARE_NS
@@ -176,6 +209,8 @@ void arm_gic_irq_enable(unsigned int intid)
 		arm_gic_write_irouter(MPIDR_TO_CORE(GET_MPIDR()), intid);
 	}
 #endif
+
+	sys_write32(mask, ISENABLER(GET_DIST_BASE(intid), idx));
 }
 
 void arm_gic_irq_disable(unsigned int intid)
@@ -210,6 +245,33 @@ bool arm_gic_irq_is_enabled(unsigned int intid)
 	return (val & mask) != 0;
 }
 
+bool arm_gic_irq_is_pending(unsigned int intid)
+{
+	uint32_t mask = BIT(intid & (GIC_NUM_INTR_PER_REG - 1));
+	uint32_t idx = intid / GIC_NUM_INTR_PER_REG;
+	uint32_t val;
+
+	val = sys_read32(ISPENDR(GET_DIST_BASE(intid), idx));
+
+	return (val & mask) != 0;
+}
+
+void arm_gic_irq_set_pending(unsigned int intid)
+{
+	uint32_t mask = BIT(intid & (GIC_NUM_INTR_PER_REG - 1));
+	uint32_t idx = intid / GIC_NUM_INTR_PER_REG;
+
+	sys_write32(mask, ISPENDR(GET_DIST_BASE(intid), idx));
+}
+
+void arm_gic_irq_clear_pending(unsigned int intid)
+{
+	uint32_t mask = BIT(intid & (GIC_NUM_INTR_PER_REG - 1));
+	uint32_t idx = intid / GIC_NUM_INTR_PER_REG;
+
+	sys_write32(mask, ICPENDR(GET_DIST_BASE(intid), idx));
+}
+
 unsigned int arm_gic_get_active(void)
 {
 	int intid;
@@ -233,7 +295,7 @@ void arm_gic_eoi(unsigned int intid)
 	 * The dsb will also ensure *completion* of previous writes with
 	 * DEVICE nGnRnE attribute.
 	 */
-	__DSB();
+	barrier_dsync_fence_full();
 
 	/* (AP -> Pending) Or (Active -> Inactive) or (AP to AP) nested case */
 	write_sysreg(intid, ICC_EOIR1_EL1);
@@ -259,9 +321,9 @@ void gic_raise_sgi(unsigned int sgi_id, uint64_t target_aff,
 	sgi_val = GICV3_SGIR_VALUE(aff3, aff2, aff1, sgi_id,
 				   SGIR_IRM_TO_AFF, target_list);
 
-	__DSB();
+	barrier_dsync_fence_full();
 	write_sysreg(sgi_val, ICC_SGI1R);
-	__ISB();
+	barrier_isync_fence_full();
 }
 
 /*
@@ -274,6 +336,16 @@ static void gicv3_rdist_enable(mem_addr_t rdist)
 {
 	if (!(sys_read32(rdist + GICR_WAKER) & BIT(GICR_WAKER_CA))) {
 		return;
+	}
+
+	if (GICR_IIDR_PRODUCT_ID_GET(sys_read32(rdist + GICR_IIDR)) >= 0x2) {
+		if (sys_read32(rdist + GICR_PWRR) & BIT(GICR_PWRR_RDPD)) {
+			sys_set_bit(rdist + GICR_PWRR, GICR_PWRR_RDAG);
+			sys_clear_bit(rdist + GICR_PWRR, GICR_PWRR_RDPD);
+			while (sys_read32(rdist + GICR_PWRR) & BIT(GICR_PWRR_RDPD)) {
+				;
+			}
+		}
 	}
 
 	sys_clear_bit(rdist + GICR_WAKER, GICR_WAKER_PS);
@@ -330,7 +402,7 @@ static void gicv3_rdist_setup_lpis(mem_addr_t rdist)
 	ctlr |= GICR_CTLR_ENABLE_LPIS;
 	sys_write32(ctlr, rdist + GICR_CTLR);
 
-	dsb();
+	barrier_dsync_fence_full();
 }
 #endif
 
@@ -402,6 +474,17 @@ static void gicv3_dist_init(void)
 	unsigned int intid;
 	unsigned int idx;
 	mem_addr_t base = GIC_DIST_BASE;
+
+#ifdef CONFIG_GIC_SAFE_CONFIG
+	/*
+	 * Currently multiple OSes can run one the different CPU Cores which share single GIC,
+	 * but GIC distributor should avoid to be re-configured in order to avoid crash the
+	 * OSes has already been started.
+	 */
+	if (sys_read32(GICD_CTLR) & (BIT(GICD_CTLR_ENABLE_G0) | BIT(GICD_CTLR_ENABLE_G1NS))) {
+		return;
+	}
+#endif
 
 	num_ints = sys_read32(GICD_TYPER);
 	num_ints &= GICD_TYPER_ITLINESNUM_MASK;
@@ -477,12 +560,95 @@ static void gicv3_dist_init(void)
 #endif
 }
 
+static uint64_t arm_gic_mpidr_to_affinity(uint64_t mpidr)
+{
+	uint64_t aff3, aff2, aff1, aff0;
+
+#if defined(CONFIG_ARM)
+	/* There is no Aff3 in AArch32 MPIDR */
+	aff3 = 0;
+#else
+	aff3 = MPIDR_AFFLVL(mpidr, 3);
+#endif
+
+	aff2 = MPIDR_AFFLVL(mpidr, 2);
+	aff1 = MPIDR_AFFLVL(mpidr, 1);
+	aff0 = MPIDR_AFFLVL(mpidr, 0);
+
+	return (aff3 << 24 | aff2 << 16 | aff1 << 8 | aff0);
+}
+
+static bool arm_gic_aff_matching(uint64_t gicr_aff, uint64_t aff)
+{
+#if defined(CONFIG_GIC_V3_RDIST_MATCHING_AFF0_ONLY)
+	uint64_t mask = BIT64_MASK(8);
+
+	return (gicr_aff & mask) == (aff & mask);
+#else
+	return gicr_aff == aff;
+#endif
+}
+
+static inline uint64_t arm_gic_get_typer(mem_addr_t addr)
+{
+	uint64_t val;
+
+#if defined(CONFIG_ARM)
+	val = sys_read32(addr);
+	val |= (uint64_t)sys_read32(addr + 4) << 32;
+#else
+	val = sys_read64(addr);
+#endif
+
+	return val;
+}
+
+static mem_addr_t arm_gic_iterate_rdists(void)
+{
+	uint64_t aff = arm_gic_mpidr_to_affinity(GET_MPIDR());
+	uint32_t idx;
+
+	/* Skip the first array entry as it refers to the GIC distributor */
+	for (idx = 1; idx < GIC_NUM_REDISTRIBUTOR_REGIONS + 1; idx++) {
+		uint64_t val;
+		mem_addr_t rdist_addr = gic_reg_regions[idx].base;
+		mem_addr_t rdist_end = rdist_addr + gic_reg_regions[idx].size;
+
+		do {
+			val = arm_gic_get_typer(rdist_addr + GICR_TYPER);
+			uint64_t gicr_aff = GICR_TYPER_AFFINITY_VALUE_GET(val);
+
+			if (arm_gic_aff_matching(gicr_aff, aff)) {
+				return rdist_addr;
+			}
+
+			if (GIC_REDISTRIBUTOR_STRIDE > 0) {
+				rdist_addr += GIC_REDISTRIBUTOR_STRIDE;
+			} else {
+				/*
+				 * Skip RD_base and SGI_base
+				 * In GICv3, GICR_TYPER.VLPIS bit is RES0 and can can be ignored
+				 * as there are no VLPI and reserved pages.
+				 */
+				rdist_addr += KB(64) * 2;
+			}
+
+		} while ((!GICR_TYPER_LAST_GET(val)) && (rdist_addr < rdist_end));
+	}
+
+	return (mem_addr_t)NULL;
+}
+
 static void __arm_gic_init(void)
 {
 	uint8_t cpu;
+	mem_addr_t gic_rd_base;
 
 	cpu = arch_curr_cpu()->id;
-	gic_rdists[cpu] = GIC_RDIST_BASE + MPIDR_TO_CORE(GET_MPIDR()) * 0x20000;
+	gic_rd_base = arm_gic_iterate_rdists();
+	__ASSERT(gic_rd_base != (mem_addr_t)NULL, "");
+
+	gic_rdists[cpu] = gic_rd_base;
 
 #ifdef CONFIG_GIC_V3_ITS
 	/* Enable LPIs in Redistributor */
@@ -494,17 +660,16 @@ static void __arm_gic_init(void)
 	gicv3_cpuif_init();
 }
 
-int arm_gic_init(const struct device *unused)
+int arm_gic_init(const struct device *dev)
 {
-	ARG_UNUSED(unused);
-
 	gicv3_dist_init();
 
 	__arm_gic_init();
 
 	return 0;
 }
-SYS_INIT(arm_gic_init, PRE_KERNEL_1, CONFIG_INTC_INIT_PRIORITY);
+DEVICE_DT_INST_DEFINE(0, arm_gic_init, NULL, NULL, NULL,
+		      PRE_KERNEL_1, CONFIG_INTC_INIT_PRIORITY, NULL);
 
 #ifdef CONFIG_SMP
 void arm_gic_secondary_init(void)

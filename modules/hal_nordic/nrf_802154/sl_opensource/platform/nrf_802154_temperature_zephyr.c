@@ -15,6 +15,7 @@
 
 #include <zephyr/device.h>
 #include <zephyr/drivers/sensor.h>
+#include <zephyr/init.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
@@ -30,7 +31,7 @@ static int8_t value = DEFAULT_TEMPERATURE;
 
 #if defined(CONFIG_NRF_802154_TEMPERATURE_UPDATE)
 
-static const struct device *device = DEVICE_DT_GET(DT_NODELABEL(temp));
+static const struct device *const device = DEVICE_DT_GET(DT_NODELABEL(temp));
 static struct k_work_delayable dwork;
 
 static void work_handler(struct k_work *work)
@@ -52,9 +53,8 @@ static void work_handler(struct k_work *work)
 	k_work_reschedule(&dwork, K_MSEC(CONFIG_NRF_802154_TEMPERATURE_UPDATE_PERIOD));
 }
 
-static int temperature_update_init(const struct device *dev)
+static int temperature_update_init(void)
 {
-	ARG_UNUSED(dev);
 
 	__ASSERT_NO_MSG(device_is_ready(device));
 

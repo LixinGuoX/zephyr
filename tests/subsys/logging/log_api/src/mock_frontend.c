@@ -88,6 +88,7 @@ void log_frontend_msg(const void *source,
 		      uint8_t *package, const void *data)
 {
 	struct mock_log_backend_msg *exp_msg = &mock.exp_msgs[mock.msg_proc_idx];
+	struct cbprintf_package_desc *package_desc = (struct cbprintf_package_desc *)package;
 
 	if (mock.do_check == false) {
 		return;
@@ -99,25 +100,36 @@ void log_frontend_msg(const void *source,
 		return;
 	}
 
-	zassert_equal(desc.level, exp_msg->level, NULL);
-	zassert_equal(desc.domain, exp_msg->domain_id, NULL);
+	if (IS_ENABLED(CONFIG_LOG_MSG_APPEND_RO_STRING_LOC)) {
+		/* If RO string locations are appended there is always at least 1: format string. */
+		zassert_true(package_desc->ro_str_cnt > 0);
+	} else {
+		zassert_equal(package_desc->ro_str_cnt, 0);
+	}
 
-	uint32_t source_id = IS_ENABLED(CONFIG_LOG_RUNTIME_FILTERING) ?
-		log_dynamic_source_id((struct log_source_dynamic_data *)source) :
-		log_const_source_id((const struct log_source_const_data *)source);
+	zassert_equal(desc.level, exp_msg->level);
+	zassert_equal(desc.domain, exp_msg->domain_id);
+
+	uint32_t source_id;
+
+	if (desc.level == LOG_LEVEL_NONE) {
+		source_id = (uintptr_t)source;
+	} else {
+		source_id = log_source_id(source);
+	}
 
 	zassert_equal(source_id, exp_msg->source_id, "got: %d, exp: %d",
 			source_id, exp_msg->source_id);
 
-	zassert_equal(exp_msg->data_len, desc.data_len, NULL);
+	zassert_equal(exp_msg->data_len, desc.data_len);
 	if (exp_msg->data_len <= sizeof(exp_msg->data)) {
-		zassert_equal(memcmp(data, exp_msg->data, desc.data_len), 0, NULL);
+		zassert_equal(memcmp(data, exp_msg->data, desc.data_len), 0);
 	}
 
 	char str[128];
 	struct test_str s = { .str = str };
-	size_t len = cbpprintf(out, &s, package);
 
+	int len = cbpprintf(out, &s, package);
 	if (len > 0) {
 		str[len] = '\0';
 	}

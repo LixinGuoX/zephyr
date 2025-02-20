@@ -17,12 +17,16 @@
 /**
  * @brief Clock Control Interface
  * @defgroup clock_control_interface Clock Control Interface
+ * @since 1.0
+ * @version 1.0.0
  * @ingroup io_interfaces
  * @{
  */
 
-#include <zephyr/types.h>
+#include <errno.h>
 #include <stddef.h>
+
+#include <zephyr/types.h>
 #include <zephyr/device.h>
 #include <zephyr/sys/__assert.h>
 #include <zephyr/sys/slist.h>
@@ -95,7 +99,7 @@ typedef int (*clock_control_configure_fn)(const struct device *dev,
 					  clock_control_subsys_t sys,
 					  void *data);
 
-struct clock_control_driver_api {
+__subsystem struct clock_control_driver_api {
 	clock_control			on;
 	clock_control			off;
 	clock_control_async_on_fn	async_on;

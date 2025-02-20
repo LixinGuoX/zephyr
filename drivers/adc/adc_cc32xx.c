@@ -29,6 +29,7 @@
 
 #define LOG_LEVEL CONFIG_ADC_LOG_LEVEL
 #include <zephyr/logging/log.h>
+#include <zephyr/irq.h>
 LOG_MODULE_REGISTER(adc_cc32xx);
 
 #define ISR_MASK (ADC_DMA_DONE | ADC_FIFO_OVERFLOW | ADC_FIFO_UNDERFLOW	\
@@ -278,7 +279,7 @@ static void adc_cc32xx_isr_ch3(const struct device *dev)
 	adc_cc32xx_isr(dev, 3);
 }
 
-static const struct adc_driver_api cc32xx_driver_api = {
+static DEVICE_API(adc, cc32xx_driver_api) = {
 	.channel_setup = adc_cc32xx_channel_setup,
 	.read = adc_cc32xx_read,
 #ifdef CONFIG_ADC_ASYNC

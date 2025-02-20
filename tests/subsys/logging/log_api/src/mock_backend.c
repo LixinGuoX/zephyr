@@ -101,11 +101,11 @@ void mock_log_backend_validate(const struct log_backend *backend, bool panic)
 		      "Got: %u, Expected: %u", mock->drop_cnt, mock->exp_drop_cnt);
 	zassert_equal(mock->msg_rec_idx, mock->msg_proc_idx,
 			"%p Recored:%d, Got: %d", mock, mock->msg_rec_idx, mock->msg_proc_idx);
-	zassert_equal(mock->panic, panic, NULL);
+	zassert_equal(mock->panic, panic);
 
 #if defined(CONFIG_LOG_MODE_DEFERRED) && \
 	defined(CONFIG_LOG_PROCESS_THREAD)
-	zassert_true(mock->evt_notified, NULL);
+	zassert_true(mock->evt_notified);
 #endif
 }
 
@@ -140,24 +140,24 @@ static void process(const struct log_backend *const backend,
 	}
 
 	zassert_equal(msg->log.hdr.timestamp, exp->timestamp,
-#if CONFIG_LOG_TIMESTAMP_64BIT
+#ifdef CONFIG_LOG_TIMESTAMP_64BIT
 		      "Got: %llu, expected: %llu",
 #else
 		      "Got: %u, expected: %u",
 #endif
 		      msg->log.hdr.timestamp, exp->timestamp);
-	zassert_equal(msg->log.hdr.desc.level, exp->level, NULL);
-	zassert_equal(msg->log.hdr.desc.domain, exp->domain_id, NULL);
+	zassert_equal(msg->log.hdr.desc.level, exp->level);
+	zassert_equal(msg->log.hdr.desc.domain, exp->domain_id);
 
 	uint32_t source_id;
 	const void *source = msg->log.hdr.source;
 
-	if (source == NULL) {
+	if (exp->level == LOG_LEVEL_INTERNAL_RAW_STRING) {
+		source_id = (uintptr_t)source;
+	} else if (source == NULL) {
 		source_id = 0;
 	} else {
-		source_id = IS_ENABLED(CONFIG_LOG_RUNTIME_FILTERING) ?
-		    log_dynamic_source_id((struct log_source_dynamic_data *)source) :
-		    log_const_source_id((const struct log_source_const_data *)source);
+		source_id = log_source_id(source);
 	}
 
 	zassert_equal(source_id, exp->source_id, "source_id:%p (exp: %d)",
@@ -165,17 +165,28 @@ static void process(const struct log_backend *const backend,
 
 	size_t len;
 	uint8_t *data;
+	struct cbprintf_package_desc *package_desc;
 
 	data = log_msg_get_data(&msg->log, &len);
-	zassert_equal(exp->data_len, len, NULL);
+
+	zassert_equal(exp->data_len, len);
 	if (exp->data_len <= sizeof(exp->data)) {
-		zassert_equal(memcmp(data, exp->data, len), 0, NULL);
+		zassert_equal(memcmp(data, exp->data, len), 0);
 	}
 
 	char str[128];
 	struct test_str s = { .str = str };
 
 	data = log_msg_get_package(&msg->log, &len);
+	package_desc = (struct cbprintf_package_desc *)data;
+
+	if (IS_ENABLED(CONFIG_LOG_MSG_APPEND_RO_STRING_LOC)) {
+		/* If RO string locations are appended there is always at least 1: format string. */
+		zassert_true(package_desc->ro_str_cnt > 0);
+	} else {
+		zassert_equal(package_desc->ro_str_cnt, 0);
+	}
+
 	len = cbpprintf(out, &s, data);
 	if (len > 0) {
 		str[len] = '\0';

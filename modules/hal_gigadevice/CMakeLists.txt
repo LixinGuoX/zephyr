@@ -6,9 +6,9 @@ if(CONFIG_HAS_GD32_HAL)
 string(TOUPPER ${CONFIG_SOC} gd32_soc_uc)
 
 set(gd32_soc_dir     ${ZEPHYR_HAL_GIGADEVICE_MODULE_DIR}/${CONFIG_SOC_SERIES})
-if(CONFIG_SOC_FAMILY_GD32_ARM)
+if(CONFIG_ARM)
   set(gd32_soc_sys_dir   ${gd32_soc_dir}/cmsis/gd/${CONFIG_SOC_SERIES})
-elseif(CONFIG_SOC_SERIES_GD32VF103)
+elseif(CONFIG_RISCV)
   set(gd32_soc_sys_dir   ${gd32_soc_dir}/riscv)
   zephyr_include_directories(${gd32_soc_dir}/riscv/drivers)
 endif()
@@ -30,12 +30,25 @@ elseif(${CONFIG_GD32_HXTAL_25MHZ})
   zephyr_compile_definitions(HXTAL_VALUE=25000000 HXTAL_VALUE_8M=25000000)
 endif()
 
+if(CONFIG_GD32_HAS_IRC_32K)
+  zephyr_compile_definitions(IRC32K_VALUE=${CONFIG_GD32_LOW_SPEED_IRC_FREQUENCY})
+endif()
+
+if(CONFIG_GD32_HAS_IRC_40K)
+  zephyr_compile_definitions(IRC40K_VALUE=${CONFIG_GD32_LOW_SPEED_IRC_FREQUENCY})
+endif()
+
 # GD32E50X series HAL public headers require extra definitions
 if(${CONFIG_SOC_SERIES_GD32E50X})
   zephyr_compile_definitions(GD32E50X)
   if (${CONFIG_SOC_GD32E507})
     zephyr_compile_definitions(GD32E50X_CL)
   endif()
+endif()
+
+# GD32A50X series HAL public headers require extra definitions
+if(${CONFIG_SOC_SERIES_GD32A50X})
+  zephyr_compile_definitions(GD32A50X)
 endif()
 
 # Global includes to be used outside hal_gigadevice

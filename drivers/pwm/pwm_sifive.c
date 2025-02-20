@@ -6,6 +6,7 @@
 
 #define DT_DRV_COMPAT sifive_pwm0
 
+#include <zephyr/arch/cpu.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/sys_io.h>
 #include <zephyr/device.h>
@@ -207,7 +208,7 @@ static int pwm_sifive_get_cycles_per_sec(const struct device *dev,
 
 /* Device Instantiation */
 
-static const struct pwm_driver_api pwm_sifive_api = {
+static DEVICE_API(pwm, pwm_sifive_api) = {
 	.set_cycles = pwm_sifive_set_cycles,
 	.get_cycles_per_sec = pwm_sifive_get_cycles_per_sec,
 };
@@ -227,7 +228,7 @@ static const struct pwm_driver_api pwm_sifive_api = {
 			    &pwm_sifive_data_##n,	\
 			    &pwm_sifive_cfg_##n,	\
 			    POST_KERNEL,	\
-			    CONFIG_PWM_SIFIVE_INIT_PRIORITY,	\
+			    CONFIG_PWM_INIT_PRIORITY,	\
 			    &pwm_sifive_api);
 
 DT_INST_FOREACH_STATUS_OKAY(PWM_SIFIVE_INIT)

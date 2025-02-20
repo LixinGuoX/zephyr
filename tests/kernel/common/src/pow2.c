@@ -5,7 +5,7 @@
  */
 
 #include <zephyr/ztest.h>
-#include <zephyr/zephyr.h>
+#include <zephyr/kernel.h>
 
 /**
  * @brief Test the Z_POW2_CEIL() macro
@@ -75,3 +75,6 @@ ZTEST(pow2, test_pow2_ceil)
 	test_pow2_ceil_x(8, 8);
 	test_pow2_ceil_x(9, 16);
 }
+
+extern void *common_setup(void);
+ZTEST_SUITE(pow2, NULL, common_setup, NULL, NULL, NULL);

@@ -1,5 +1,5 @@
 /** @file
- *  @brief Bluetooth Microphone Input Control Profile (MICP) Microphone Device role.
+ *  @brief Bluetooth Microphone Control Profile (MICP) Microphone Device role.
  *
  *  Copyright (c) 2020 Bose Corporation
  *  Copyright (c) 2020-2022 Nordic Semiconductor ASA
@@ -8,13 +8,16 @@
  *  SPDX-License-Identifier: Apache-2.0
  */
 
-#include <zephyr/zephyr.h>
-#include <zephyr/sys/printk.h>
-#include <stdlib.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
+#include <zephyr/bluetooth/audio/aics.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/audio/micp.h>
+#include <zephyr/kernel.h>
+#include <zephyr/sys/printk.h>
+#include <zephyr/sys/util.h>
 
 static void micp_mic_dev_mute_cb(uint8_t mute)
 {

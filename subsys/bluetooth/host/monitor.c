@@ -11,11 +11,13 @@
 #include <zephyr/types.h>
 #include <stdbool.h>
 
-#include <zephyr/zephyr.h>
+#include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/init.h>
 #include <zephyr/drivers/uart_pipe.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/printk-hooks.h>
+#include <zephyr/sys/libc-hooks.h>
 #include <zephyr/drivers/uart.h>
 
 #include <zephyr/logging/log_backend.h>
@@ -57,7 +59,7 @@ static struct {
 	atomic_t evt;
 	atomic_t acl_tx;
 	atomic_t acl_rx;
-#if defined(CONFIG_BT_BREDR)
+#if defined(CONFIG_BT_CLASSIC)
 	atomic_t sco_tx;
 	atomic_t sco_rx;
 #endif
@@ -79,7 +81,7 @@ static void drop_add(uint16_t opcode)
 	case BT_MONITOR_ACL_RX_PKT:
 		atomic_inc(&drops.acl_rx);
 		break;
-#if defined(CONFIG_BT_BREDR)
+#if defined(CONFIG_BT_CLASSIC)
 	case BT_MONITOR_SCO_TX_PKT:
 		atomic_inc(&drops.sco_tx);
 		break;
@@ -95,6 +97,8 @@ static void drop_add(uint16_t opcode)
 
 #if defined(CONFIG_BT_DEBUG_MONITOR_RTT)
 #include <SEGGER_RTT.h>
+
+static bool panic_mode;
 
 #define RTT_BUFFER_NAME CONFIG_BT_DEBUG_MONITOR_RTT_BUFFER_NAME
 #define RTT_BUF_SIZE CONFIG_BT_DEBUG_MONITOR_RTT_BUFFER_SIZE
@@ -122,10 +126,13 @@ static void monitor_send(const void *data, size_t len)
 	}
 
 	if (!drop) {
-		SEGGER_RTT_LOCK();
-		cnt = SEGGER_RTT_WriteNoLock(CONFIG_BT_DEBUG_MONITOR_RTT_BUFFER,
-					     rtt_buf, rtt_buf_offset);
-		SEGGER_RTT_UNLOCK();
+		if (panic_mode) {
+			cnt = SEGGER_RTT_WriteNoLock(CONFIG_BT_DEBUG_MONITOR_RTT_BUFFER,
+						     rtt_buf, rtt_buf_offset);
+		} else {
+			cnt = SEGGER_RTT_Write(CONFIG_BT_DEBUG_MONITOR_RTT_BUFFER,
+					       rtt_buf, rtt_buf_offset);
+		}
 	}
 
 	if (!cnt) {
@@ -141,7 +148,16 @@ static void poll_out(char c)
 	monitor_send(&c, sizeof(c));
 }
 #elif defined(CONFIG_BT_DEBUG_MONITOR_UART)
-static const struct device *monitor_dev;
+static const struct device *const monitor_dev =
+#if DT_HAS_CHOSEN(zephyr_bt_mon_uart)
+	DEVICE_DT_GET(DT_CHOSEN(zephyr_bt_mon_uart));
+#elif !defined(CONFIG_UART_CONSOLE) && DT_HAS_CHOSEN(zephyr_console)
+	/* Fall back to console UART if it's available */
+	DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+#else
+	NULL;
+#error "BT_DEBUG_MONITOR_UART enabled but no UART specified"
+#endif
 
 static void poll_out(char c)
 {
@@ -172,8 +188,15 @@ static void encode_drops(struct bt_monitor_hdr *hdr, uint8_t type,
 
 static uint32_t monitor_ts_get(void)
 {
-	return (k_cycle_get_32() /
-		(sys_clock_hw_cycles_per_sec() / MONITOR_TS_FREQ));
+	uint64_t cycle;
+
+	if (IS_ENABLED(CONFIG_TIMER_HAS_64BIT_CYCLE_COUNTER)) {
+		cycle = k_cycle_get_64();
+	} else {
+		cycle = k_cycle_get_32();
+	}
+
+	return (cycle / (sys_clock_hw_cycles_per_sec() / MONITOR_TS_FREQ));
 }
 
 static inline void encode_hdr(struct bt_monitor_hdr *hdr, uint32_t timestamp,
@@ -193,7 +216,7 @@ static inline void encode_hdr(struct bt_monitor_hdr *hdr, uint32_t timestamp,
 	encode_drops(hdr, BT_MONITOR_EVENT_DROPS, &drops.evt);
 	encode_drops(hdr, BT_MONITOR_ACL_TX_DROPS, &drops.acl_tx);
 	encode_drops(hdr, BT_MONITOR_ACL_RX_DROPS, &drops.acl_rx);
-#if defined(CONFIG_BT_BREDR)
+#if defined(CONFIG_BT_CLASSIC)
 	encode_drops(hdr, BT_MONITOR_SCO_TX_DROPS, &drops.sco_tx);
 	encode_drops(hdr, BT_MONITOR_SCO_RX_DROPS, &drops.sco_rx);
 #endif
@@ -219,7 +242,7 @@ void bt_monitor_send(uint16_t opcode, const void *data, size_t len)
 	atomic_clear_bit(&flags, BT_LOG_BUSY);
 }
 
-void bt_monitor_new_index(uint8_t type, uint8_t bus, bt_addr_t *addr,
+void bt_monitor_new_index(uint8_t type, uint8_t bus, const bt_addr_t *addr,
 			  const char *name)
 {
 	struct bt_monitor_new_index pkt;
@@ -258,9 +281,6 @@ static int monitor_console_out(int c)
 
 	return c;
 }
-
-extern void __printk_hook_install(int (*fn)(int));
-extern void __stdout_hook_install(int (*fn)(int));
 #endif /* !CONFIG_UART_CONSOLE && !CONFIG_RTT_CONSOLE && !CONFIG_LOG_PRINTK */
 
 #ifndef CONFIG_LOG_MODE_MINIMAL
@@ -349,6 +369,9 @@ static void monitor_log_process(const struct log_backend *const backend,
 
 static void monitor_log_panic(const struct log_backend *const backend)
 {
+#if defined(CONFIG_BT_DEBUG_MONITOR_RTT)
+	panic_mode = true;
+#endif
 }
 
 static void monitor_log_init(const struct log_backend *const backend)
@@ -365,9 +388,8 @@ static const struct log_backend_api monitor_log_api = {
 LOG_BACKEND_DEFINE(bt_monitor, monitor_log_api, true);
 #endif /* CONFIG_LOG_MODE_MINIMAL */
 
-static int bt_monitor_init(const struct device *d)
+static int bt_monitor_init(void)
 {
-	ARG_UNUSED(d);
 
 #if defined(CONFIG_BT_DEBUG_MONITOR_RTT)
 	static uint8_t rtt_up_buf[RTT_BUF_SIZE];
@@ -376,8 +398,6 @@ static int bt_monitor_init(const struct device *d)
 				  RTT_BUFFER_NAME, rtt_up_buf, RTT_BUF_SIZE,
 				  SEGGER_RTT_MODE_NO_BLOCK_SKIP);
 #elif defined(CONFIG_BT_DEBUG_MONITOR_UART)
-	monitor_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_bt_mon_uart));
-
 	__ASSERT_NO_MSG(device_is_ready(monitor_dev));
 
 #if defined(CONFIG_UART_INTERRUPT_DRIVEN)

@@ -6,7 +6,8 @@
 
 #include <zephyr/ztest.h>
 #include <zephyr/arch/cpu.h>
-#include <zephyr/arch/arm/aarch32/cortex_m/cmsis.h>
+#include <cmsis_core.h>
+#include <zephyr/sys/barrier.h>
 
 /* Offset for the Direct interrupt used in this test. */
 #define DIRECT_ISR_OFFSET (CONFIG_NUM_IRQS - 1)
@@ -40,10 +41,8 @@ ZTEST(arm_irq_advanced_features, test_arm_dynamic_direct_interrupts)
 	irq_disable(DIRECT_ISR_OFFSET);
 
 	/* Attach the ISR handler at run time. */
-	irq_connect_dynamic(DIRECT_ISR_OFFSET, 0 /* highest priority */,
-		arm_direct_isr_handler_0,
-		NULL,
-		0);
+	irq_connect_dynamic(DIRECT_ISR_OFFSET, 0 /* highest priority */, arm_direct_isr_handler_0,
+			    NULL, 0);
 
 	/* Enable and pend the interrupt */
 	irq_enable(DIRECT_ISR_OFFSET);
@@ -53,8 +52,8 @@ ZTEST(arm_irq_advanced_features, test_arm_dynamic_direct_interrupts)
 	 * Instruction barriers to make sure the NVIC IRQ is
 	 * set to pending state before 'test_flag' is checked.
 	 */
-	__DSB();
-	__ISB();
+	barrier_dsync_fence_full();
+	barrier_isync_fence_full();
 
 	/* Confirm test flag is set by the dynamic direct ISR handler. */
 	post_flag = test_flag;
@@ -64,10 +63,8 @@ ZTEST(arm_irq_advanced_features, test_arm_dynamic_direct_interrupts)
 	irq_disable(DIRECT_ISR_OFFSET);
 
 	/* Attach an alternative ISR handler at run-time. */
-	irq_connect_dynamic(DIRECT_ISR_OFFSET, 0 /* highest priority */,
-		arm_direct_isr_handler_1,
-		NULL,
-		0);
+	irq_connect_dynamic(DIRECT_ISR_OFFSET, 0 /* highest priority */, arm_direct_isr_handler_1,
+			    NULL, 0);
 
 	/* Enable and pend the interrupt */
 	irq_enable(DIRECT_ISR_OFFSET);
@@ -77,8 +74,8 @@ ZTEST(arm_irq_advanced_features, test_arm_dynamic_direct_interrupts)
 	 * Instruction barriers to make sure the NVIC IRQ is
 	 * set to pending state before 'test_flag' is checked.
 	 */
-	__DSB();
-	__ISB();
+	barrier_dsync_fence_full();
+	barrier_isync_fence_full();
 
 	/* Confirm test flag is set by the dynamic direct ISR handler. */
 	post_flag = test_flag;

@@ -40,7 +40,7 @@
 		};
 
 		gic: interrupt-controller@f8f01000 {
-			compatible = "arm,gic";
+			compatible = "arm,gic-v1", "arm,gic";
 			status = "okay";
 			reg = <0xf8f01000 0x1000>,
 				<0xf8f00100 0x100>;
@@ -128,7 +128,6 @@
 					IRQ_DEFAULT_PRIORITY>;
 			interrupt-names = "irq_0";
 
-			ranges;
 			#address-cells = <1>;
 			#size-cells = <0>;
 

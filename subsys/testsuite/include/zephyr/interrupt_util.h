@@ -7,10 +7,8 @@
 #ifndef INTERRUPT_UTIL_H_
 #define INTERRUPT_UTIL_H_
 
-#define MS_TO_US(ms)  (ms * USEC_PER_MSEC)
-
 #if defined(CONFIG_CPU_CORTEX_M)
-#include <zephyr/arch/arm/aarch32/cortex_m/cmsis.h>
+#include <cmsis_core.h>
 
 static inline uint32_t get_available_nvic_line(uint32_t initial_offset)
 {
@@ -89,7 +87,10 @@ static inline void trigger_irq(int irq)
 	sys_write32(GICD_SGIR_TGTFILT_REQONLY | GICD_SGIR_SGIINTID(irq),
 		    GICD_SGIR);
 #else
-	gic_raise_sgi(irq, GET_MPIDR(), BIT(MPIDR_TO_CORE(GET_MPIDR())));
+	uint64_t mpidr = GET_MPIDR();
+	uint8_t aff0 = MPIDR_AFFLVL(mpidr, 0);
+
+	gic_raise_sgi(irq, mpidr, BIT(aff0));
 #endif
 }
 
@@ -106,7 +107,7 @@ static inline void trigger_irq(int irq)
 #include <zephyr/drivers/interrupt_controller/loapic.h>
 #define VECTOR_MASK 0xFF
 #else
-#include <zephyr/sys/arch_interface.h>
+#include <zephyr/arch/arch_interface.h>
 #define LOAPIC_ICR_IPI_TEST  0x00004000U
 #endif
 
@@ -155,14 +156,21 @@ static inline void trigger_irq(int vector)
 }
 
 #elif defined(CONFIG_ARCH_POSIX)
-#include "irq_ctrl.h"
+#include <zephyr/arch/posix/posix_soc_if.h>
 
 static inline void trigger_irq(int irq)
 {
-	hw_irq_ctrl_raise_im_from_sw(irq);
+	posix_sw_set_pending_IRQ(irq);
 }
 
 #elif defined(CONFIG_RISCV)
+#if defined(CONFIG_NUCLEI_ECLIC) || defined(CONFIG_NRFX_CLIC)
+void riscv_clic_irq_set_pending(uint32_t irq);
+static inline void trigger_irq(int irq)
+{
+	riscv_clic_irq_set_pending(irq);
+}
+#else
 static inline void trigger_irq(int irq)
 {
 	uint32_t mip;
@@ -171,7 +179,7 @@ static inline void trigger_irq(int irq)
 			  : "=r" (mip)
 			  : "r" (1 << irq));
 }
-
+#endif
 #elif defined(CONFIG_XTENSA)
 static inline void trigger_irq(int irq)
 {
@@ -192,6 +200,15 @@ extern void z_mips_enter_irq(int);
 static inline void trigger_irq(int irq)
 {
 	z_mips_enter_irq(irq);
+}
+
+#elif defined(CONFIG_CPU_CORTEX_R5) && defined(CONFIG_VIM)
+
+extern void z_vim_arm_enter_irq(int);
+
+static inline void trigger_irq(int irq)
+{
+	z_vim_arm_enter_irq(irq);
 }
 
 #else

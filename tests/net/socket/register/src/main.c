@@ -13,7 +13,7 @@ LOG_MODULE_REGISTER(net_test, CONFIG_NET_SOCKETS_LOG_LEVEL);
 #include <zephyr/net/net_ip.h>
 #include <zephyr/net/ethernet.h>
 #include <zephyr/net/socket.h>
-#include <zephyr/net/socket_can.h>
+#include <zephyr/net/socketcan.h>
 
 struct test_case {
 	int family;
@@ -103,7 +103,7 @@ static const struct test_result {
 		/* 10 */
 		.test_case.family = AF_PACKET,
 		.test_case.type = SOCK_RAW,
-		.test_case.proto = ETH_P_ALL,
+		.test_case.proto = htons(ETH_P_ALL),
 		.result = 0,
 	},
 	{
@@ -142,6 +142,20 @@ static const struct test_result {
 		.test_case.proto = 254,
 		.result = -1,
 		.error = EPROTONOSUPPORT,
+	},
+	{
+		/* 16 */
+		.test_case.family = AF_PACKET,
+		.test_case.type = SOCK_RAW,
+		.test_case.proto = htons(ETH_P_IEEE802154),
+		.result = 0,
+	},
+	{
+		/* 17 */
+		.test_case.family = AF_PACKET,
+		.test_case.type = SOCK_DGRAM,
+		.test_case.proto = htons(ETH_P_IEEE802154),
+		.result = 0,
 	},
 };
 
@@ -187,11 +201,14 @@ static bool is_tls(int family, int type, int proto)
 
 static bool is_packet(int family, int type, int proto)
 {
-	if (type != SOCK_RAW || proto != ETH_P_ALL) {
-		return false;
+	proto = ntohs(proto);
+
+	if (((type == SOCK_RAW) && (proto == ETH_P_ALL || proto == ETH_P_IEEE802154)) ||
+	    ((type == SOCK_DGRAM) && (proto > 0))) {
+		return true;
 	}
 
-	return true;
+	return false;
 }
 
 static bool is_can(int family, int type, int proto)
@@ -230,9 +247,9 @@ ZTEST(net_socket_register, test_create_sockets)
 	for (i = 0; i < ARRAY_SIZE(expected_result); i++, current_test++) {
 		errno = 0;
 
-		fd = socket(expected_result[i].test_case.family,
-			    expected_result[i].test_case.type,
-			    expected_result[i].test_case.proto);
+		fd = zsock_socket(expected_result[i].test_case.family,
+				  expected_result[i].test_case.type,
+				  expected_result[i].test_case.proto);
 
 		if (errno == EPROTONOSUPPORT) {
 			func_called--;
@@ -256,7 +273,7 @@ ZTEST(net_socket_register, test_create_sockets)
 		}
 
 		if (fd >= 0) {
-			close(fd);
+			zsock_close(fd);
 		}
 	}
 

@@ -446,11 +446,10 @@ int montecarlo_ecdh(int num_tests, bool verbose)
 	return TC_PASS;
 }
 
-void test_ecc_dh(void)
+ZTEST(tinycrypt, test_ecc_dh)
 {
 	unsigned int result = TC_PASS;
 
-	TC_START("Performing ECC-DH tests:");
 
 	/* Setup of the Cryptographically Secure PRNG. */
 	uECC_set_rng(&default_CSPRNG);

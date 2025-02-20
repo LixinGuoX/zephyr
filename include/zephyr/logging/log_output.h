@@ -10,6 +10,7 @@
 #include <zephyr/sys/util.h>
 #include <stdarg.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/kernel.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,6 +51,12 @@ extern "C" {
  */
 #define LOG_OUTPUT_FLAG_FORMAT_SYSLOG		BIT(6)
 
+/** @brief Flag thread id or name prefix. */
+#define LOG_OUTPUT_FLAG_THREAD			BIT(7)
+
+/** @brief Flag forcing to skip logging the source. */
+#define LOG_OUTPUT_FLAG_SKIP_SOURCE		BIT(8)
+
 /**@} */
 
 /** @brief Supported backend logging format types for use
@@ -60,6 +67,8 @@ extern "C" {
 #define LOG_OUTPUT_SYST 1
 
 #define LOG_OUTPUT_DICT 2
+
+#define LOG_OUTPUT_CUSTOM 3
 
 /**
  * @brief Prototype of the function processing output data.
@@ -142,9 +151,10 @@ void log_output_msg_process(const struct log_output *log_output,
  * @param timestamp	Timestamp.
  * @param domain	Domain name string. Can be NULL.
  * @param source	Source name string. Can be NULL.
+ * @param tid		Thread ID.
  * @param level		Criticality level.
  * @param package	Cbprintf package with a logging message string.
- * @param data		Data passed to hexdump API. Can bu NULL.
+ * @param data		Data passed to hexdump API. Can be NULL.
  * @param data_len	Data length.
  * @param flags		Formatting flags. See @ref LOG_OUTPUT_FLAGS.
  */
@@ -152,6 +162,7 @@ void log_output_process(const struct log_output *log_output,
 			log_timestamp_t timestamp,
 			const char *domain,
 			const char *source,
+			k_tid_t tid,
 			uint8_t level,
 			const uint8_t *package,
 			const uint8_t *data,
@@ -179,11 +190,34 @@ void log_output_msg_syst_process(const struct log_output *log_output,
  */
 void log_output_dropped_process(const struct log_output *output, uint32_t cnt);
 
+/** @brief Write to the output buffer.
+ *
+ * @param outf Output function.
+ * @param buf  Buffer.
+ * @param len  Buffer length.
+ * @param ctx  Context passed to the %p outf.
+ */
+static inline void log_output_write(log_output_func_t outf, uint8_t *buf, size_t len, void *ctx)
+{
+	int processed;
+
+	while (len != 0) {
+		processed = outf(buf, len, ctx);
+		len -= processed;
+		buf += processed;
+	}
+}
+
 /** @brief Flush output buffer.
  *
  * @param output Pointer to the log output instance.
  */
-void log_output_flush(const struct log_output *output);
+static inline void log_output_flush(const struct log_output *output)
+{
+	log_output_write(output->func, output->buf, output->control_block->offset,
+			 output->control_block->ctx);
+	output->control_block->offset = 0;
+}
 
 /** @brief Function for setting user context passed to the output function.
  *
@@ -219,7 +253,7 @@ void log_output_timestamp_freq_set(uint32_t freq);
  *
  * @return Timestamp value in us.
  */
-uint64_t log_output_timestamp_to_us(uint32_t timestamp);
+uint64_t log_output_timestamp_to_us(log_timestamp_t timestamp);
 
 /**
  * @}

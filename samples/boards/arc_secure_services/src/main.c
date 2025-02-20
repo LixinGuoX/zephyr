@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <zephyr/zephyr.h>
+#include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/devicetree.h>
 
@@ -39,7 +39,7 @@ K_THREAD_DEFINE(thread_a, STACKSIZE, threadA, NULL, NULL, NULL,
 		PRIORITY, 0, 0);
 
 
-void main(void)
+int main(void)
 {
 	/* necessary configuration before go to normal */
 	int32_t i = 0;
@@ -56,4 +56,5 @@ void main(void)
 				 __func__, i++);
 		k_msleep(SLEEPTIME);
 	}
+	return 0;
 }

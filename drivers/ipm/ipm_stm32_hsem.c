@@ -14,6 +14,7 @@
 #include "stm32_hsem.h"
 
 #include <zephyr/logging/log.h>
+#include <zephyr/irq.h>
 LOG_MODULE_REGISTER(ipm_stm32_hsem, CONFIG_IPM_LOG_LEVEL);
 
 #define HSEM_CPU1                   1
@@ -51,8 +52,9 @@ void stm32_hsem_mailbox_ipm_rx_isr(const struct device *dev)
 	uint32_t mask_semid = (1U << data->rx_semid);
 
 	/* Check semaphore rx_semid interrupt status */
-	if (!ll_hsem_isactiveflag_cmisr(HSEM, mask_semid))
+	if (!ll_hsem_isactiveflag_cmisr(HSEM, mask_semid)) {
 		return;
+	}
 
 	/* Notify user with NULL data pointer */
 	if (data->callback) {
@@ -152,7 +154,7 @@ static int stm32_hsem_mailbox_init(const struct device *dev)
 {
 	struct stm32_hsem_mailbox_data *data = dev->data;
 	const struct stm32_hsem_mailbox_config *cfg = dev->config;
-	const struct device *clk = DEVICE_DT_GET(STM32_CLOCK_CONTROL_NODE);
+	const struct device *const clk = DEVICE_DT_GET(STM32_CLOCK_CONTROL_NODE);
 
 	/* Config transfer semaphore */
 	switch (CONFIG_IPM_STM32_HSEM_CPU) {
@@ -163,7 +165,7 @@ static int stm32_hsem_mailbox_init(const struct device *dev)
 		}
 
 		/* Enable clock */
-		if (clock_control_on(clk, (clock_control_subsys_t *)&cfg->pclken) != 0) {
+		if (clock_control_on(clk, (clock_control_subsys_t)&cfg->pclken) != 0) {
 			LOG_WRN("Failed to enable clock");
 			return -EIO;
 		}
@@ -182,7 +184,7 @@ static int stm32_hsem_mailbox_init(const struct device *dev)
 	return 0;
 }
 
-static const struct ipm_driver_api stm32_hsem_mailbox_ipm_dirver_api = {
+static DEVICE_API(ipm, stm32_hsem_mailbox_ipm_dirver_api) = {
 	.send = stm32_hsem_mailbox_ipm_send,
 	.register_callback = stm32_hsem_mailbox_ipm_register_callback,
 	.max_data_size_get = stm32_hsem_mailbox_ipm_max_data_size_get,

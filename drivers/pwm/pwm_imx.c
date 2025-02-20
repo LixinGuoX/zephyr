@@ -6,6 +6,7 @@
 
 #include <errno.h>
 #include <zephyr/drivers/pwm.h>
+#include <zephyr/kernel.h>
 #include <soc.h>
 #include <device_imx.h>
 #include <zephyr/drivers/pinctrl.h>
@@ -151,7 +152,7 @@ static int imx_pwm_init(const struct device *dev)
 	return 0;
 }
 
-static const struct pwm_driver_api imx_pwm_driver_api = {
+static DEVICE_API(pwm, imx_pwm_driver_api) = {
 	.set_cycles = imx_pwm_set_cycles,
 	.get_cycles_per_sec = imx_pwm_get_cycles_per_sec,
 };
@@ -169,7 +170,7 @@ static const struct pwm_driver_api imx_pwm_driver_api = {
 	DEVICE_DT_INST_DEFINE(n, &imx_pwm_init, NULL,			\
 			    &imx_pwm_data_##n,				\
 			    &imx_pwm_config_##n, POST_KERNEL,		\
-			    CONFIG_KERNEL_INIT_PRIORITY_DEVICE,		\
+			    CONFIG_PWM_INIT_PRIORITY,			\
 			    &imx_pwm_driver_api);
 
 #if DT_HAS_COMPAT_STATUS_OKAY(fsl_imx27_pwm)

@@ -6,6 +6,9 @@
 
 #define DT_DRV_COMPAT syscon
 
+#include <errno.h>
+
+#include <zephyr/arch/cpu.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/device.h>
 #include <zephyr/init.h>
@@ -118,7 +121,7 @@ static int syscon_generic_get_size(const struct device *dev, size_t *size)
 	return 0;
 }
 
-static const struct syscon_driver_api syscon_generic_driver_api = {
+static DEVICE_API(syscon, syscon_generic_driver_api) = {
 	.read = syscon_generic_read_reg,
 	.write = syscon_generic_write_reg,
 	.get_base = syscon_generic_get_base,

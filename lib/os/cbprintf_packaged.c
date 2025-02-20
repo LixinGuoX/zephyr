@@ -14,6 +14,8 @@
 #include <sys/types.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/sys/__assert.h>
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(cbprintf_package, CONFIG_CBPRINTF_PACKAGE_LOG_LEVEL);
 
 #if defined(CONFIG_CBPRINTF_PACKAGE_SUPPORT_TAGGED_ARGUMENTS) && \
 	!Z_C_GENERIC
@@ -46,7 +48,7 @@ static inline bool ptr_in_rodata(const char *addr)
 
 #if defined(__CHECKER__)
 static int cbprintf_via_va_list(cbprintf_cb out,
-				cbvprintf_exteral_formatter_func formatter,
+				cbvprintf_external_formatter_func formatter,
 				void *ctx,
 				const char *fmt, void *buf)
 {
@@ -71,7 +73,7 @@ BUILD_ASSERT(sizeof(va_list) == sizeof(struct __va_list),
 	     "architecture specific support is wrong");
 
 static int cbprintf_via_va_list(cbprintf_cb out,
-				cbvprintf_exteral_formatter_func formatter,
+				cbvprintf_external_formatter_func formatter,
 				void *ctx,
 				const char *fmt, void *buf)
 {
@@ -109,7 +111,7 @@ BUILD_ASSERT(sizeof(va_list) == sizeof(struct __va_list),
 	     "architecture specific support is wrong");
 
 static int cbprintf_via_va_list(cbprintf_cb out,
-				cbvprintf_exteral_formatter_func formatter,
+				cbvprintf_external_formatter_func formatter,
 				void *ctx,
 				const char *fmt, void *buf)
 {
@@ -146,7 +148,7 @@ BUILD_ASSERT(sizeof(va_list) == sizeof(struct __va_list),
 	     "architecture specific support is wrong");
 
 static int cbprintf_via_va_list(cbprintf_cb out,
-				cbvprintf_exteral_formatter_func formatter,
+				cbvprintf_external_formatter_func formatter,
 				void *ctx,
 				const char *fmt, void *buf)
 {
@@ -175,7 +177,7 @@ BUILD_ASSERT(sizeof(va_list) == sizeof(void *),
 	     "architecture specific support is needed");
 
 static int cbprintf_via_va_list(cbprintf_cb out,
-				cbvprintf_exteral_formatter_func formatter,
+				cbvprintf_external_formatter_func formatter,
 				void *ctx,
 				const char *fmt, void *buf)
 {
@@ -210,7 +212,7 @@ static size_t get_package_len(void *packaged)
 	buf += ros_nbr;
 
 	/* Move beyond strings appended to the package. */
-	for (int i = 0; i < s_nbr; i++) {
+	for (unsigned int i = 0; i < s_nbr; i++) {
 		buf++;
 		buf += strlen((const char *)buf) + 1;
 	}
@@ -240,16 +242,18 @@ int cbvprintf_package(void *packaged, size_t len, uint32_t flags,
 #define STR_POS_MASK BIT_MASK(7)
 
 /* Buffer offset abstraction for better code clarity. */
-#define BUF_OFFSET ((uintptr_t)buf - (uintptr_t)buf0)
+#define BUF_OFFSET (buf - (uintptr_t)buf0)
 
 	uint8_t *buf0 = packaged;  /* buffer start (may be NULL) */
-	uint8_t *buf = buf0;       /* current buffer position */
+	uintptr_t buf = (uintptr_t)buf0; /* current buffer position */
 	unsigned int size;         /* current argument's size */
 	unsigned int align;        /* current argument's required alignment */
 	uint8_t str_ptr_pos[16];   /* string pointer positions */
+	uint8_t str_ptr_arg[16];   /* string pointer argument index */
 	unsigned int s_idx = 0;    /* index into str_ptr_pos[] */
 	unsigned int s_rw_cnt = 0; /* number of rw strings */
 	unsigned int s_ro_cnt = 0; /* number of ro strings */
+	int arg_idx	      = -1; /* Argument index. Preincremented thus starting from -1.*/
 	unsigned int i;
 	const char *s;
 	bool parsing = false;
@@ -320,7 +324,7 @@ int cbvprintf_package(void *packaged, size_t len, uint32_t flags,
 	 * Otherwise we must ensure we can store at least
 	 * the pointer to the format string itself.
 	 */
-	if (buf0 != NULL && BUF_OFFSET + sizeof(char *) > len) {
+	if ((buf0 != NULL) && (BUF_OFFSET + sizeof(char *)) > len) {
 		return -ENOSPC;
 	}
 
@@ -331,7 +335,8 @@ int cbvprintf_package(void *packaged, size_t len, uint32_t flags,
 	 * reason for the post-decrement on fmt as it will be incremented
 	 * prior to the next (actually first) round of that loop.
 	 */
-	s = fmt--;
+	s = fmt;
+	--fmt;
 	align = VA_STACK_ALIGN(char *);
 	size = sizeof(char *);
 	goto process_string;
@@ -350,7 +355,7 @@ int cbvprintf_package(void *packaged, size_t len, uint32_t flags,
 			size = sizeof(int);
 
 			/* align destination buffer location */
-			buf = (void *)ROUND_UP(buf, align);
+			buf = ROUND_UP(buf, align);
 
 			/* make sure the data fits */
 			if (buf0 != NULL && BUF_OFFSET + size > len) {
@@ -425,14 +430,14 @@ int cbvprintf_package(void *packaged, size_t len, uint32_t flags,
 				}
 
 				/* align destination buffer location */
-				buf = (void *) ROUND_UP(buf, align);
+				buf = ROUND_UP(buf, align);
 				if (buf0 != NULL) {
 					/* make sure it fits */
-					if (BUF_OFFSET + size > len) {
+					if ((BUF_OFFSET + size) > len) {
 						return -ENOSPC;
 					}
 					if (Z_CBPRINTF_VA_STACK_LL_DBL_MEMCPY) {
-						memcpy(buf, &v, size);
+						memcpy((void *)buf, (uint8_t *)&v, size);
 					} else if (fmt[-1] == 'L') {
 						*(long double *)buf = v.ld;
 					} else {
@@ -468,6 +473,7 @@ int cbvprintf_package(void *packaged, size_t len, uint32_t flags,
 			if (!parsing) {
 				if (*fmt == '%') {
 					parsing = true;
+					arg_idx++;
 					align = VA_STACK_ALIGN(int);
 					size = sizeof(int);
 				}
@@ -476,6 +482,7 @@ int cbvprintf_package(void *packaged, size_t len, uint32_t flags,
 			switch (*fmt) {
 			case '%':
 				parsing = false;
+				arg_idx--;
 				continue;
 
 			case '#':
@@ -570,14 +577,14 @@ int cbvprintf_package(void *packaged, size_t len, uint32_t flags,
 					size = sizeof(double);
 				}
 				/* align destination buffer location */
-				buf = (void *) ROUND_UP(buf, align);
+				buf = ROUND_UP(buf, align);
 				if (buf0 != NULL) {
 					/* make sure it fits */
 					if (BUF_OFFSET + size > len) {
 						return -ENOSPC;
 					}
 					if (Z_CBPRINTF_VA_STACK_LL_DBL_MEMCPY) {
-						memcpy(buf, &v, size);
+						memcpy((void *)buf, (uint8_t *)&v, size);
 					} else if (fmt[-1] == 'L') {
 						*(long double *)buf = v.ld;
 					} else {
@@ -596,10 +603,10 @@ int cbvprintf_package(void *packaged, size_t len, uint32_t flags,
 		}
 
 		/* align destination buffer location */
-		buf = (void *) ROUND_UP(buf, align);
+		buf = ROUND_UP(buf, align);
 
 		/* make sure the data fits */
-		if (buf0 != NULL && BUF_OFFSET + size > len) {
+		if ((buf0 != NULL) && (BUF_OFFSET + size) > len) {
 			return -ENOSPC;
 		}
 
@@ -641,6 +648,7 @@ process_string:
 					 * We will append non-ro strings later.
 					 */
 					str_ptr_pos[s_idx] = s_ptr_idx;
+					str_ptr_arg[s_idx] = arg_idx;
 					if (is_ro) {
 						/* flag read-only string. */
 						str_ptr_pos[s_idx] |= STR_POS_RO_FLAG;
@@ -648,12 +656,18 @@ process_string:
 					} else {
 						s_rw_cnt++;
 					}
-				} else if (is_ro || rws_pos_en) {
+				} else if (is_ro) {
 					/*
 					 * Add only pointer position prefix
 					 * when counting strings.
 					 */
 					len += 1;
+				} else if (rws_pos_en) {
+					/*
+					 * Add only pointer position prefix and
+					 * argument index when counting strings.
+					 */
+					len += 2;
 				} else {
 					/*
 					 * Add the string length, the final '\0'
@@ -686,7 +700,7 @@ process_string:
 
 			if (buf0 != NULL) {
 				if (Z_CBPRINTF_VA_STACK_LL_DBL_MEMCPY) {
-					memcpy(buf, &v, sizeof(long long));
+					memcpy((void *)buf, (uint8_t *)&v, sizeof(long long));
 				} else {
 					*(long long *)buf = v;
 				}
@@ -704,7 +718,7 @@ process_string:
 	 * worth of va_list, or about 127 arguments on a 64-bit system
 	 * (twice that on 32-bit systems). That ought to be good enough.
 	 */
-	if (BUF_OFFSET / sizeof(int) > 255) {
+	if ((BUF_OFFSET / sizeof(int)) > 255) {
 		__ASSERT(false, "too many format args");
 		return -EINVAL;
 	}
@@ -740,7 +754,7 @@ process_string:
 #endif
 
 	/* Store strings pointer locations of read only strings. */
-	if (s_ro_cnt) {
+	if (s_ro_cnt != 0U) {
 		for (i = 0; i < s_idx; i++) {
 			if (!(str_ptr_pos[i] & STR_POS_RO_FLAG)) {
 				continue;
@@ -749,11 +763,12 @@ process_string:
 			uint8_t pos = str_ptr_pos[i] & STR_POS_MASK;
 
 			/* make sure it fits */
-			if (BUF_OFFSET + 1 > len) {
+			if ((BUF_OFFSET + 1) > len) {
 				return -ENOSPC;
 			}
 			/* store the pointer position prefix */
-			*buf++ = pos;
+			*(uint8_t *)buf = pos;
+			++buf;
 		}
 	}
 
@@ -766,6 +781,8 @@ process_string:
 
 		if (rws_pos_en) {
 			size = 0;
+			*(uint8_t *)buf = str_ptr_arg[i];
+			++buf;
 		} else {
 			/* retrieve the string pointer */
 			s = *(char **)(buf0 + str_ptr_pos[i] * sizeof(int));
@@ -776,13 +793,14 @@ process_string:
 		}
 
 		/* make sure it fits */
-		if (BUF_OFFSET + 1 + size > len) {
+		if ((BUF_OFFSET + 1 + size) > len) {
 			return -ENOSPC;
 		}
 		/* store the pointer position prefix */
-		*buf++ = str_ptr_pos[i];
+		*(uint8_t *)buf = str_ptr_pos[i];
+		++buf;
 		/* copy the string with its terminating '\0' */
-		memcpy(buf, s, size);
+		memcpy((void *)buf, (uint8_t *)s, size);
 		buf += size;
 	}
 
@@ -811,7 +829,7 @@ int cbprintf_package(void *packaged, size_t len, uint32_t flags,
 }
 
 int cbpprintf_external(cbprintf_cb out,
-		       cbvprintf_exteral_formatter_func formatter,
+		       cbvprintf_external_formatter_func formatter,
 		       void *ctx, void *packaged)
 {
 	uint8_t *buf = packaged;
@@ -830,14 +848,15 @@ int cbpprintf_external(cbprintf_cb out,
 	rws_nbr   = hdr->hdr.desc.rw_str_cnt;
 
 	/* Locate the string table */
-	s = (char *)(buf + args_size + ros_nbr + rws_nbr);
+	s = (char *)(buf + args_size + ros_nbr + 2 * rws_nbr);
 
 	/*
 	 * Patch in string pointers.
 	 */
 	for (i = 0; i < s_nbr; i++) {
 		/* Locate pointer location for this string */
-		s_idx = *(uint8_t *)s++;
+		s_idx = *(uint8_t *)s;
+		++s;
 		ps = (char **)(buf + s_idx * sizeof(int));
 		/* update the pointer with current string location */
 		*ps = s;
@@ -850,6 +869,45 @@ int cbpprintf_external(cbprintf_cb out,
 
 	/* Turn this into a va_list and  print it */
 	return cbprintf_via_va_list(out, formatter, ctx, hdr->fmt, buf);
+}
+
+/* Function checks if character might be format specifier. Check is relaxed since
+ * compiler ensures that correct format specifier is used so it is enough to check
+ * that character is not one of potential modifier (e.g. number, dot, etc.).
+ */
+static bool is_fmt_spec(char c)
+{
+	return (c >= 64) && (c <= 122);
+}
+
+/* Function checks if nth argument is a pointer (%p). Returns true is yes. Returns
+ * false if not or if string does not have nth argument.
+ */
+bool is_ptr(const char *fmt, int n)
+{
+	char c;
+	bool mod = false;
+	int cnt = 0;
+
+	while ((c = *fmt++) != '\0') {
+		if (mod) {
+			if (cnt == n) {
+				if (c == 'p') {
+					return true;
+				} else if (is_fmt_spec(c)) {
+					return false;
+				}
+			} else if (is_fmt_spec(c)) {
+				cnt++;
+				mod = false;
+			}
+		}
+		if (c == '%') {
+			mod = !mod;
+		}
+	}
+
+	return false;
 }
 
 int cbprintf_package_convert(void *in_packaged,
@@ -865,6 +923,7 @@ int cbprintf_package_convert(void *in_packaged,
 	uint8_t *buf = in_packaged;
 	uint32_t *buf32 = in_packaged;
 	unsigned int args_size, ros_nbr, rws_nbr;
+	bool fmt_present = flags & CBPRINTF_PACKAGE_CONVERT_PTR_CHECK ? true : false;
 	bool rw_cpy;
 	bool ro_cpy;
 	struct cbprintf_package_desc *in_desc = in_packaged;
@@ -876,14 +935,14 @@ int cbprintf_package_convert(void *in_packaged,
 	 */
 	ros_nbr = in_desc->ro_str_cnt;
 	ro_cpy = ros_nbr &&
-		(flags & CBPRINTF_PACKAGE_COPY_RO_STR) == CBPRINTF_PACKAGE_COPY_RO_STR;
+		(flags & CBPRINTF_PACKAGE_CONVERT_RO_STR) == CBPRINTF_PACKAGE_CONVERT_RO_STR;
 
 	/* Get number of RW string indexes in the package and check if copying
 	 * includes appending those strings.
 	 */
 	rws_nbr = in_desc->rw_str_cnt;
 	rw_cpy = rws_nbr > 0 &&
-		 (flags & CBPRINTF_PACKAGE_COPY_RW_STR) == CBPRINTF_PACKAGE_COPY_RW_STR;
+		 (flags & CBPRINTF_PACKAGE_CONVERT_RW_STR) == CBPRINTF_PACKAGE_CONVERT_RW_STR;
 
 	/* If flags are not set or appending request without rw string indexes
 	 * present is chosen, just do a simple copy (or length calculation).
@@ -908,6 +967,7 @@ int cbprintf_package_convert(void *in_packaged,
 	/* Pointer to array with string locations. Array starts with read-only
 	 * string locations.
 	 */
+	const char *fmt = *(const char **)(buf + sizeof(void *));
 	uint8_t *str_pos = &buf[args_size];
 	size_t strl_cnt = 0;
 
@@ -915,7 +975,7 @@ int cbprintf_package_convert(void *in_packaged,
 	if (cb == NULL) {
 		out_len = (int)in_len;
 		if (ro_cpy) {
-			for (int i = 0; i < ros_nbr; i++) {
+			for (unsigned int i = 0; i < ros_nbr; i++) {
 				const char *str = *(const char **)&buf32[*str_pos];
 				int len = append_string(cb, NULL, str, 0);
 
@@ -927,39 +987,53 @@ int cbprintf_package_convert(void *in_packaged,
 				str_pos++;
 			}
 		} else {
-			if (ros_nbr && flags & CBPRINTF_PACKAGE_COPY_KEEP_RO_STR) {
-				str_pos += ros_nbr;
-			}
+			str_pos += ros_nbr;
 		}
 
 		bool drop_ro_str_pos = !(flags &
-					(CBPRINTF_PACKAGE_COPY_KEEP_RO_STR |
-					 CBPRINTF_PACKAGE_COPY_RO_STR));
+					(CBPRINTF_PACKAGE_CONVERT_KEEP_RO_STR |
+					 CBPRINTF_PACKAGE_CONVERT_RO_STR));
 
 		/* Handle RW strings. */
-		for (int i = 0; i < rws_nbr; i++) {
-			const char *str = *(const char **)&buf32[*str_pos];
+		for (unsigned int i = 0; i < rws_nbr; i++) {
+			uint8_t arg_idx = *str_pos++;
+			uint8_t arg_pos = *str_pos++;
+			const char *str = *(const char **)&buf32[arg_pos];
 			bool is_ro = ptr_in_rodata(str);
+			int len;
 
-			if ((is_ro && flags & CBPRINTF_PACKAGE_COPY_RO_STR) ||
-			    (!is_ro && flags & CBPRINTF_PACKAGE_COPY_RW_STR)) {
-				int len = append_string(cb, NULL, str, 0);
+			if (IS_ENABLED(CONFIG_CBPRINTF_CONVERT_CHECK_PTR) &&
+			    fmt_present && is_ptr(fmt, arg_idx)) {
+				LOG_WRN("(unsigned) char * used for %%p argument. "
+					"It's recommended to cast it to void * because "
+					"it may cause misbehavior in certain "
+					"configurations. String:\"%s\" argument:%d", fmt, arg_idx);
+				/* Since location is being dropped, decrement
+				 * output length by 2 (argument index + position)
+				 */
+				out_len -= 2;
+				continue;
+			}
+
+			if (is_ro) {
+				if (flags & CBPRINTF_PACKAGE_CONVERT_RO_STR) {
+					goto calculate_string_length;
+				} else {
+					out_len -= drop_ro_str_pos ? 2 : 1;
+				}
+			} else if (flags & CBPRINTF_PACKAGE_CONVERT_RW_STR) {
+calculate_string_length:
+				len = append_string(cb, NULL, str, 0);
 
 				/* If possible store calculated string length. */
 				if (strl && strl_cnt < strl_len) {
 					strl[strl_cnt++] = (uint16_t)len;
 				}
-				out_len += len;
-			}
-
-			if (is_ro && drop_ro_str_pos) {
-				/* If read-only string location is dropped decreased
-				 * length.
+				/* string length decremented by 1 because argument
+				 * index is dropped.
 				 */
-				out_len--;
+				out_len += (len - 1);
 			}
-
-			str_pos++;
 		}
 
 		return out_len;
@@ -983,7 +1057,7 @@ int cbprintf_package_convert(void *in_packaged,
 		scpy_cnt = ros_nbr;
 		keep_cnt = 0;
 		dst = cpy_str_pos;
-	} else if (ros_nbr && flags & CBPRINTF_PACKAGE_COPY_KEEP_RO_STR) {
+	} else if (ros_nbr && flags & CBPRINTF_PACKAGE_CONVERT_KEEP_RO_STR) {
 		scpy_cnt = 0;
 		keep_cnt = ros_nbr;
 		dst = keep_str_pos;
@@ -1001,38 +1075,45 @@ int cbprintf_package_convert(void *in_packaged,
 	 * Note that there may be read-only strings there. Use address evaluation
 	 * to determine if strings is read-only.
 	 */
-	for (int i = 0; i < rws_nbr; i++) {
-		const char *str = *(const char **)&buf32[*str_pos];
+	for (unsigned int i = 0; i < rws_nbr; i++) {
+		uint8_t arg_idx = *str_pos++;
+		uint8_t arg_pos = *str_pos++;
+		const char *str = *(const char **)&buf32[arg_pos];
 		bool is_ro = ptr_in_rodata(str);
 
+		if (IS_ENABLED(CONFIG_CBPRINTF_CONVERT_CHECK_PTR) &&
+		    fmt_present && is_ptr(fmt, arg_idx)) {
+			continue;
+		}
+
 		if (is_ro) {
-			if (flags & CBPRINTF_PACKAGE_COPY_RO_STR) {
+			if (flags & CBPRINTF_PACKAGE_CONVERT_RO_STR) {
 				__ASSERT_NO_MSG(scpy_cnt < sizeof(cpy_str_pos));
-				cpy_str_pos[scpy_cnt++] = *str_pos;
-			} else if (flags & CBPRINTF_PACKAGE_COPY_KEEP_RO_STR) {
+				cpy_str_pos[scpy_cnt++] = arg_pos;
+			} else if (flags & CBPRINTF_PACKAGE_CONVERT_KEEP_RO_STR) {
 				__ASSERT_NO_MSG(keep_cnt < sizeof(keep_str_pos));
-				keep_str_pos[keep_cnt++] = *str_pos;
+				keep_str_pos[keep_cnt++] = arg_pos;
 			} else {
 				/* Drop information about ro_str location. */
 			}
 		} else {
-			if (flags & CBPRINTF_PACKAGE_COPY_RW_STR) {
+			if (flags & CBPRINTF_PACKAGE_CONVERT_RW_STR) {
 				__ASSERT_NO_MSG(scpy_cnt < sizeof(cpy_str_pos));
-				cpy_str_pos[scpy_cnt++] = *str_pos;
+				cpy_str_pos[scpy_cnt++] = arg_pos;
 			} else {
 				__ASSERT_NO_MSG(keep_cnt < sizeof(keep_str_pos));
-				keep_str_pos[keep_cnt++] = *str_pos;
+				keep_str_pos[keep_cnt++] = arg_idx;
+				keep_str_pos[keep_cnt++] = arg_pos;
 			}
 		}
-		str_pos++;
 	}
 
 	/* Set amount of strings appended to the package. */
 	out_desc.len = in_desc->len;
 	out_desc.str_cnt = in_desc->str_cnt + scpy_cnt;
-	out_desc.rw_str_cnt = (flags & CBPRINTF_PACKAGE_COPY_RW_STR) ? 0 : keep_cnt;
-	out_desc.ro_str_cnt = (flags & CBPRINTF_PACKAGE_COPY_RO_STR) ? 0 :
-			((flags & CBPRINTF_PACKAGE_COPY_KEEP_RO_STR) ? keep_cnt : 0);
+	out_desc.rw_str_cnt = (flags & CBPRINTF_PACKAGE_CONVERT_RW_STR) ? 0 : (keep_cnt / 2);
+	out_desc.ro_str_cnt = (flags & CBPRINTF_PACKAGE_CONVERT_RO_STR) ? 0 :
+			((flags & CBPRINTF_PACKAGE_CONVERT_KEEP_RO_STR) ? keep_cnt : 0);
 
 	/* Temporary overwrite input descriptor to allow bulk transfer */
 	struct cbprintf_package_desc in_desc_backup = *in_desc;
@@ -1055,7 +1136,7 @@ int cbprintf_package_convert(void *in_packaged,
 	out_len += rv;
 
 	/* Copy appended strings from source package to destination. */
-	size_t strs_len = in_len - (args_size + ros_nbr + rws_nbr);
+	size_t strs_len = in_len - (args_size + ros_nbr + 2 * rws_nbr);
 
 	rv = cb(str_pos, strs_len, ctx);
 	if (rv < 0) {
@@ -1064,10 +1145,10 @@ int cbprintf_package_convert(void *in_packaged,
 	out_len += rv;
 
 	/* Append strings */
-	for (int i = 0; i < scpy_cnt; i++) {
+	for (unsigned int i = 0; i < scpy_cnt; i++) {
 		uint8_t loc = cpy_str_pos[i];
 		const char *str = *(const char **)&buf32[loc];
-		uint16_t str_len = strl ? strl[i] : 0;
+		uint16_t str_len = (strl && (i < strl_len)) ? strl[i] : 0;
 
 		rv = cb(&loc, 1, ctx);
 		if (rv < 0) {

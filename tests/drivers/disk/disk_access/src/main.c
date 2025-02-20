@@ -9,17 +9,38 @@
  * this test with an disk that has useful data
  */
 
-#include <zephyr/zephyr.h>
+#include <zephyr/kernel.h>
 #include <zephyr/ztest.h>
 #include <zephyr/storage/disk_access.h>
 #include <zephyr/device.h>
 
-#if IS_ENABLED(CONFIG_DISK_DRIVER_SDMMC)
-#define DISK_NAME CONFIG_SDMMC_VOLUME_NAME
-#elif IS_ENABLED(CONFIG_DISK_DRIVER_RAM)
-#define DISK_NAME CONFIG_DISK_RAM_VOLUME_NAME
+#ifdef CONFIG_DISK_DRIVER_LOOPBACK
+#include <ff.h>
+#include <zephyr/fs/fs.h>
+#include <zephyr/drivers/loopback_disk.h>
+#endif
+
+#if defined(CONFIG_DISK_DRIVER_SDMMC)
+#define DISK_NAME_PHYS "SD"
+#elif defined(CONFIG_DISK_DRIVER_MMC)
+#define DISK_NAME_PHYS "SD2"
+#elif defined(CONFIG_DISK_DRIVER_FLASH)
+#define DISK_NAME_PHYS "NAND"
+#elif defined(CONFIG_NVME)
+#define DISK_NAME_PHYS "nvme0n0"
+#elif defined(CONFIG_DISK_DRIVER_RAM)
+/* Since ramdisk is enabled by default on e.g. qemu boards, it needs to be checked last to not
+ * override other backends.
+ */
+#define DISK_NAME_PHYS "RAM"
 #else
 #error "No disk device defined, is your board supported?"
+#endif
+
+#ifdef CONFIG_DISK_DRIVER_LOOPBACK
+#define DISK_NAME "loopback0"
+#else
+#define DISK_NAME DISK_NAME_PHYS
 #endif
 
 /* Assume the largest sector we will encounter is 512 bytes */
@@ -37,8 +58,46 @@ static const char *disk_pdrv = DISK_NAME;
 static uint32_t disk_sector_count;
 static uint32_t disk_sector_size;
 
-static uint8_t scratch_buf[2][SECTOR_COUNT4 * SECTOR_SIZE + 1];
+/* + 4 to make sure the second buffer is dword-aligned for NVME */
+static uint8_t scratch_buf[2][SECTOR_COUNT4 * SECTOR_SIZE + 4];
 
+#ifdef CONFIG_DISK_DRIVER_LOOPBACK
+#define BACKING_PATH "/"DISK_NAME_PHYS":"
+
+static struct loopback_disk_access lo_access;
+static FATFS fat_fs;
+static struct fs_mount_t backing_mount = {
+	.type = FS_FATFS,
+	.mnt_point = BACKING_PATH,
+	.fs_data = &fat_fs,
+};
+static const uint8_t zero_kb[1024] = {};
+static void setup_loopback_backing(void)
+{
+	int rc;
+
+	rc = fs_mkfs(FS_FATFS, (uintptr_t)&BACKING_PATH[1], NULL, 0);
+	zassert_equal(rc, 0, "Failed to format backing file system");
+
+	rc = fs_mount(&backing_mount);
+	zassert_equal(rc, 0, "Failed to mount backing file system");
+
+	struct fs_file_t f;
+
+	fs_file_t_init(&f);
+	rc = fs_open(&f, BACKING_PATH "/loopback.img", FS_O_WRITE | FS_O_CREATE);
+	zassert_equal(rc, 0, "Failed to create backing file");
+	for (int i = 0; i < 64; i++) {
+		rc = fs_write(&f, zero_kb, sizeof(zero_kb));
+		zassert_equal(rc, sizeof(zero_kb), "Failed to enlarge backing file");
+	}
+	rc = fs_close(&f);
+	zassert_equal(rc, 0, "Failed to close backing file");
+
+	rc = loopback_disk_access_register(&lo_access, BACKING_PATH "/loopback.img", DISK_NAME);
+	zassert_equal(rc, 0, "Loopback disk access initialization failed");
+}
+#endif
 
 /* Sets up test by initializing disk */
 static void test_setup(void)
@@ -94,7 +153,12 @@ static void test_sector_read(uint8_t *buf, uint32_t num_sectors)
 	rc = read_sector(buf, 0, num_sectors);
 	zassert_equal(rc, 0, "Failed to read from sector zero");
 	/* Read from a sector in the "middle" of the disk */
-	sector = MAX(((disk_sector_count / 2) - num_sectors), 0);
+	if (disk_sector_count / 2 > num_sectors) {
+		sector = disk_sector_count / 2 - num_sectors;
+	} else {
+		sector = 0;
+	}
+
 	rc = read_sector(buf, sector, num_sectors);
 	zassert_equal(rc, 0, "Failed to read from mid disk sector");
 	/* Read from the last sector */
@@ -147,7 +211,12 @@ static void test_sector_write(uint8_t *wbuf, uint8_t *rbuf, uint32_t num_sectors
 	rc = write_sector_checked(wbuf, rbuf, 0, num_sectors);
 	zassert_equal(rc, 0, "Failed to write to sector zero");
 	/* Write to a sector in the "middle" of the disk */
-	sector = MAX(((disk_sector_count / 2) - num_sectors), 0);
+	if (disk_sector_count / 2 > num_sectors) {
+		sector = disk_sector_count / 2 - num_sectors;
+	} else {
+		sector = 0;
+	}
+
 	rc = write_sector_checked(wbuf, rbuf, sector, num_sectors);
 	zassert_equal(rc, 0, "Failed to write to mid disk sector");
 	/* Write to the last sector */
@@ -160,7 +229,7 @@ static void test_sector_write(uint8_t *wbuf, uint8_t *rbuf, uint32_t num_sectors
 }
 
 /* Test multiple reads in series, and reading from a variety of blocks */
-static void test_read(void)
+ZTEST(disk_driver, test_read)
 {
 	int rc, i;
 
@@ -188,7 +257,7 @@ static void test_read(void)
 /* test writing data, and then verifying it was written correctly.
  * WARNING: this test is destructive- it will overwrite data on the disk!
  */
-static void test_write(void)
+ZTEST(disk_driver, test_write)
 {
 	int rc, i;
 
@@ -206,14 +275,14 @@ static void test_write(void)
 	}
 }
 
-
-void test_main(void)
+static void *disk_driver_setup(void)
 {
-	ztest_test_suite(disk_driver_test,
-		ztest_unit_test(test_setup),
-		ztest_unit_test(test_read),
-		ztest_unit_test(test_write)
-	);
+#ifdef CONFIG_DISK_DRIVER_LOOPBACK
+	setup_loopback_backing();
+#endif
+	test_setup();
 
-	ztest_run_test_suite(disk_driver_test);
+	return NULL;
 }
+
+ZTEST_SUITE(disk_driver, NULL, disk_driver_setup, NULL, NULL, NULL);

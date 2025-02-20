@@ -22,7 +22,7 @@ LOG_MODULE_REGISTER(test);
 #define DT_NO_CLOCK 0xFFFFU
 
 /* Not device related, but keep it to ensure core clock config is correct */
-static void test_sysclk_freq(void)
+ZTEST(stm32u5_devices_clocks, test_sysclk_freq)
 {
 	uint32_t soc_sys_clk_freq;
 
@@ -33,7 +33,7 @@ static void test_sysclk_freq(void)
 			CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC, soc_sys_clk_freq);
 }
 
-static void test_spi_clk_config(void)
+ZTEST(stm32u5_devices_clocks, test_spi_clk_config)
 {
 	static const struct stm32_pclken pclken[] = STM32_DT_CLOCKS(DT_NODELABEL(spi1));
 
@@ -62,14 +62,14 @@ static void test_spi_clk_config(void)
 
 		if (pclken[1].bus == STM32_SRC_HSI16) {
 			zassert_equal(spi1_actual_domain_clk, RCC_SPI1CLKSOURCE_HSI,
-					"Expected SPI src: HSI (%d). Actual SPI src: %d",
+					"Expected SPI src: HSI (0x%x). Actual: 0x%x",
 					RCC_SPI1CLKSOURCE_HSI, spi1_actual_domain_clk);
 		} else if (pclken[1].bus == STM32_SRC_SYSCLK) {
 			zassert_equal(spi1_actual_domain_clk, RCC_SPI1CLKSOURCE_SYSCLK,
-					"Expected SPI src: SYSCLK (%d). Actual SPI src: %d",
+					"Expected SPI src: SYSCLK (0x%x). Actual: 0x%x",
 					RCC_SPI1CLKSOURCE_SYSCLK, spi1_actual_domain_clk);
 		} else {
-			zassert_true(1, "Unexpected clk src(%d)", spi1_actual_domain_clk);
+			zassert_true(1, "Unexpected clk src (0x%x)", spi1_actual_domain_clk);
 		}
 
 		/* Test get_rate(source clk) */
@@ -80,7 +80,7 @@ static void test_spi_clk_config(void)
 
 		spi1_actual_clk_freq = HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_SPI1);
 		zassert_equal(spi1_dt_clk_freq, spi1_actual_clk_freq,
-				"Expected SPI clk: (%d). Actual SPI clk: %d",
+				"Expected SPI clk: %d. Actual: %d",
 				spi1_dt_clk_freq, spi1_actual_clk_freq);
 	} else {
 		/* No domain clock available, get rate from gating clock */
@@ -93,7 +93,7 @@ static void test_spi_clk_config(void)
 
 		spi1_actual_clk_freq = HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_SPI1);
 		zassert_equal(spi1_dt_clk_freq, spi1_actual_clk_freq,
-				"Expected SPI clk: (%d). Actual SPI clk: %d",
+				"Expected SPI clk freq: %d. Actual: %d",
 				spi1_dt_clk_freq, spi1_actual_clk_freq);
 	}
 
@@ -108,12 +108,4 @@ static void test_spi_clk_config(void)
 	/* Test clock_off(domain clk) */
 	/* Not supported today */
 }
-
-void test_main(void)
-{
-	ztest_test_suite(test_stm32u5_devices_clocks,
-		ztest_unit_test(test_sysclk_freq),
-		ztest_unit_test(test_spi_clk_config)
-			 );
-	ztest_run_test_suite(test_stm32u5_devices_clocks);
-}
+ZTEST_SUITE(stm32u5_devices_clocks, NULL, NULL, NULL, NULL, NULL);

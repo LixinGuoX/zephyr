@@ -16,41 +16,41 @@ description: GigaDevice GD32 ADC
 
 compatible: "gd,gd32-adc"
 
-include: [adc-controller.yaml, pinctrl-device.yaml]
+include: [adc-controller.yaml, reset-device.yaml, pinctrl-device.yaml]
 
 properties:
-    reg:
-      required: true
+  reg:
+    required: true
 
-    rcu-periph-clock:
-      type: int
-      description: Reset Control Unit Peripheral Clock ID
-      required: true
+  resets:
+    required: true
 
-    rcu-clock-source:
-      type: int
-      required: false
-      description: |
-        Some GD32 ADC have additional clock source, like IRC14M or IRC28M.
-        This property used to select the clock and related prescaler, valid
-        values defined at 'dts-bindings/adc/gd32xxx.h' headers.
+  clocks:
+    required: true
 
-    channels:
-      type: int
-      description: Number of external channels
-      required: true
+  rcu-clock-source:
+    type: int
+    description: |
+      Some GD32 ADC have additional clock source, like IRC14M or IRC28M.
+      This property used to select the clock and related prescaler, valid
+      values defined at 'dts-bindings/adc/gd32xxx.h' headers.
 
-    interrupts:
-      required: true
+  channels:
+    type: int
+    description: Number of external channels
+    required: true
 
-    "#io-channel-cells":
-      const: 1
+  interrupts:
+    required: true
 
-    pinctrl-0:
-      required: true
+  "#io-channel-cells":
+    const: 1
 
-    pinctrl-names:
-      required: true
+  pinctrl-0:
+    required: true
+
+  pinctrl-names:
+    required: true
 
 io-channel-cells:
-    - input
+  - input

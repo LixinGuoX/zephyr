@@ -11,6 +11,7 @@
 #include <zephyr/sys/__assert.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/logging/log_output.h>
+#include <zephyr/sys/iterable_sections.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -82,6 +83,10 @@ struct log_backend_control_block {
 	void *ctx;
 	uint8_t id;
 	bool active;
+	bool initialized;
+
+	/* Initialization level. */
+	uint8_t level;
 };
 
 /**
@@ -93,9 +98,6 @@ struct log_backend {
 	const char *name;
 	bool autostart;
 };
-
-extern const struct log_backend __log_backends_start[];
-extern const struct log_backend __log_backends_end[];
 
 /**
  * @brief Macro for creating a logger backend instance.
@@ -127,7 +129,7 @@ extern const struct log_backend __log_backends_end[];
  * @brief Initialize or initiate the logging backend.
  *
  * If backend initialization takes longer time it could block logging thread
- * if backend is autostarted. That is because all backends are initilized in
+ * if backend is autostarted. That is because all backends are initialized in
  * the context of the logging thread. In that case, backend shall provide
  * function for polling for readiness (@ref log_backend_is_ready).
  *
@@ -139,6 +141,7 @@ static inline void log_backend_init(const struct log_backend *const backend)
 	if (backend->api->init) {
 		backend->api->init(backend);
 	}
+	backend->cb->initialized = true;
 }
 
 /**
@@ -246,7 +249,11 @@ static inline uint8_t log_backend_id_get(const struct log_backend *const backend
  */
 static inline const struct log_backend *log_backend_get(uint32_t idx)
 {
-	return &__log_backends_start[idx];
+	const struct log_backend *backend;
+
+	STRUCT_SECTION_GET(log_backend, idx, &backend);
+
+	return backend;
 }
 
 /**
@@ -256,7 +263,11 @@ static inline const struct log_backend *log_backend_get(uint32_t idx)
  */
 static inline int log_backend_count_get(void)
 {
-	return __log_backends_end - __log_backends_start;
+	int cnt;
+
+	STRUCT_SECTION_COUNT(log_backend, &cnt);
+
+	return cnt;
 }
 
 /**

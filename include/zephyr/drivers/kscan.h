@@ -16,6 +16,7 @@
 #ifndef ZEPHYR_INCLUDE_DRIVERS_KB_SCAN_H_
 #define ZEPHYR_INCLUDE_DRIVERS_KB_SCAN_H_
 
+#include <errno.h>
 #include <zephyr/types.h>
 #include <stddef.h>
 #include <zephyr/device.h>
@@ -27,11 +28,15 @@ extern "C" {
 /**
  * @brief KSCAN APIs
  * @defgroup kscan_interface Keyboard Scan Driver APIs
+ * @since 2.1
+ * @version 1.0.0
+ * @deprecated
  * @ingroup io_interfaces
  * @{
  */
 
 /**
+ * @deprecated
  * @brief Keyboard scan callback called when user press/release
  * a key on a matrix keyboard.
  *
@@ -45,6 +50,7 @@ typedef void (*kscan_callback_t)(const struct device *dev, uint32_t row,
 				 bool pressed);
 
 /**
+ * @deprecated
  * @cond INTERNAL_HIDDEN
  *
  * Keyboard scan driver API definition and system call entry points.
@@ -66,10 +72,11 @@ __subsystem struct kscan_driver_api {
  */
 
 /**
+ * @deprecated
  * @brief Configure a Keyboard scan instance.
  *
  * @param dev Pointer to the device structure for the driver instance.
- * @param callback called when keyboard devices reply to to a keyboard
+ * @param callback called when keyboard devices reply to a keyboard
  * event such as key pressed/released.
  *
  * @retval 0 If successful.
@@ -87,6 +94,7 @@ static inline int z_impl_kscan_config(const struct device *dev,
 	return api->config(dev, callback);
 }
 /**
+ * @deprecated
  * @brief Enables callback.
  * @param dev Pointer to the device structure for the driver instance.
  *
@@ -108,6 +116,7 @@ static inline int z_impl_kscan_enable_callback(const struct device *dev)
 }
 
 /**
+ * @deprecated
  * @brief Disables callback.
  * @param dev Pointer to the device structure for the driver instance.
  *
@@ -136,6 +145,6 @@ static inline int z_impl_kscan_disable_callback(const struct device *dev)
  * @}
  */
 
-#include <syscalls/kscan.h>
+#include <zephyr/syscalls/kscan.h>
 
 #endif /* ZEPHYR_INCLUDE_DRIVERS_KB_SCAN_H_ */

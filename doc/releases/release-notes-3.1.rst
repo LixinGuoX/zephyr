@@ -25,6 +25,9 @@ Changes in this release
 * LoRaWAN: The message type parameter in :c:func:`lorawan_send` was changed
   from ``uint8_t`` to ``enum lorawan_message_type``. If ``0`` was passed for
   unconfirmed message, this has to be changed to ``LORAWAN_MSG_UNCONFIRMED``.
+* Bluetooth: Applications where :kconfig:option:`CONFIG_BT_EATT` is enabled
+  must set the :c:member:`chan_opt` field on the GATT parameter structs.
+  To keep the old behavior use :c:enumerator:`BT_ATT_CHAN_OPT_NONE`.
 
 * Disk Subsystem: SPI mode SD cards now use the SD subsystem to communicate
   with SD cards. See :ref:`the disk access api <disk_access_api>` for an
@@ -487,7 +490,7 @@ Drivers and Sensors
     series. Interrupt driven mode. Supports 1 and 8 lines in Single or Dual
     Transfer Modes.
   * STM32L5: Added support for Single Bank.
-  * STM32 QSPI driver was extended with with QER (SFDP, DTS), custom quad write opcode
+  * STM32 QSPI driver was extended with QER (SFDP, DTS), custom quad write opcode
     and 1-1-4 read mode.
   * Added support for STM32U5 series.
 
@@ -617,7 +620,7 @@ Networking
   * Added a
     :kconfig:option:`CONFIG_NET_ETHERNET_FORWARD_UNRECOGNISED_ETHERTYPE`
     option, which allows to forward frames with unrecognised EtherType to the
-    netowrk stack.
+    network stack.
 
 * HTTP:
 
@@ -1718,7 +1721,7 @@ Addressed issues
 * :github:`43344` - intel_adsp_cavs25: samples/subsys/logging/syst is failing with a timeout when the sample is enabled to run on intel_adsp_cavs25
 * :github:`43333` - RFC: Bring zcbor as CBOR decoder/encoder in replacement for TinyCBOR
 * :github:`43326` - Unstable SD Card performance on Teensy 4.1
-* :github:`43319` - Hardware reset cause api sets reset pin bit everytime the api is called
+* :github:`43319` - Hardware reset cause api sets reset pin bit every time the api is called
 * :github:`43316` - stm32wl55 cannot enable PLL source as MSI
 * :github:`43314` - LE Audio: BAP ``sent`` callback missing
 * :github:`43310` - disco_l475_iot1: BLE not working

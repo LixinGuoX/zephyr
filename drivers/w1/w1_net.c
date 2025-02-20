@@ -31,7 +31,9 @@ LOG_MODULE_REGISTER(w1, CONFIG_W1_LOG_LEVEL);
  * W1_SEARCH_LAST_SLAVE, and in case no slave participated in the search,
  * the discrepancy is set to W1_SEARCH_NO_SLAVE.
  *
- * The implementation is similar to suggested in the maxim application note 187.
+ * The implementation is similar to that suggested in the Maxim Integrated
+ * application note 187.
+ * @see https://www.analog.com/media/en/technical-documentation/app-notes/1wire-search-algorithm.pdf
  * The master reads the first ROM bit and its complementary value of all slaves.
  * Due to physical characteristics, the value received is a
  * logical AND of all slaves' 1st bit. Slaves only continue to
@@ -183,7 +185,7 @@ int z_impl_w1_search_bus(const struct device *dev, uint8_t command,
 		 * Only big-endian targets need to swap, such that struct's
 		 * bytes are stored in big-endian byte order.
 		 */
-		if (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__) {
+		if (IS_ENABLED(CONFIG_BIG_ENDIAN)) {
 			sys_memcpy_swap(&found_rom, &found_rom_inv_64, 8);
 		} else {
 			*(uint64_t *)&found_rom = found_rom_inv_64;
@@ -346,7 +348,7 @@ int w1_skip_rom(const struct device *dev, const struct w1_slave_config *config)
 
 static int reset_select(const struct device *dev, const struct w1_slave_config *config)
 {
-	if (w1_get_slave_count(dev) > 1) {
+	if (IS_ENABLED(CONFIG_W1_NET_FORCE_MULTIDROP_ADDRESSING) || w1_get_slave_count(dev) > 1) {
 		return match_rom(dev, config);
 	}
 

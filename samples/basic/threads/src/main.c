@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <zephyr/zephyr.h>
+#include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/sys/printk.h>
@@ -20,11 +20,11 @@
 #define LED0_NODE DT_ALIAS(led0)
 #define LED1_NODE DT_ALIAS(led1)
 
-#if !DT_NODE_HAS_STATUS(LED0_NODE, okay)
+#if !DT_NODE_HAS_STATUS_OKAY(LED0_NODE)
 #error "Unsupported board: led0 devicetree alias is not defined"
 #endif
 
-#if !DT_NODE_HAS_STATUS(LED1_NODE, okay)
+#if !DT_NODE_HAS_STATUS_OKAY(LED1_NODE)
 #error "Unsupported board: led1 devicetree alias is not defined"
 #endif
 
